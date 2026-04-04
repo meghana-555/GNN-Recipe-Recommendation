@@ -30,11 +30,11 @@ LOG_DIR = Path(settings.LOG_DIR)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # Structured JSON logger for the serving audit trail
-from pythonjsonlogger import json as jsonlog  # python-json-logger >= 3.x compat
+from pythonjsonlogger import jsonlogger
 
 _serving_handler = logging.FileHandler(LOG_DIR / "serving.log")
 _serving_handler.setFormatter(
-    jsonlog.JsonFormatter(
+    jsonlogger.JsonFormatter(
         fmt="%(asctime)s %(levelname)s %(message)s",
         rename_fields={"asctime": "timestamp", "levelname": "level"},
     )
