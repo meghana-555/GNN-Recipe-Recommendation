@@ -1,0 +1,106 @@
+# =============================================================================
+# Docker Compose for the GNN Recipe Recommendation Serving Layer
+#
+# Services:
+#   redis       — Redis cache for pre-computed recommendations
+#   batch       — One-shot job: trains model (if needed) and pre-computes recs
+#   api         — FastAPI serving endpoint (Redis-backed)
+#   api-memory  — FastAPI serving endpoint (in-memory cache, baseline)
+#   evaluation  — Load testing / benchmarking suite
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Redis cache
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Batch pre-computation (one-shot job)
+  #
+  # Mount your CSV data files into /data and the model output dir into /models.
+  # On first run it will train the model (~10-15 min) then score all users.
+  # On subsequent runs it loads the existing model and scores directly.
+  # ---------------------------------------------------------------------------
+  batch:
+    build: ./batch
+    volumes:
+      - ./data:/data
+      - ./models:/models
+    environment:
+      MODEL_PATH: /models/recipe_gnn_model.pt
+      DATA_DIR: /data
+      CACHE_BACKEND: redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      TOP_N: 10
+      RECIPE_METADATA_OUTPUT: /data/recipe_metadata.json
+      RECOMMENDATIONS_OUTPUT: /data/recommendations.json
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Serving API — Redis cache (optimized)
+  # ---------------------------------------------------------------------------
+  api:
+    build: ./api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+      - ./logs:/logs
+    environment:
+      CACHE_BACKEND: redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      RECIPE_METADATA_PATH: /data/recipe_metadata.json
+      RECOMMENDATIONS_PATH: /data/recommendations.json
+      LOG_DIR: /logs
+      PORT: 8000
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Serving API — In-memory cache (baseline)
+  # ---------------------------------------------------------------------------
+  api-memory:
+    build: ./api
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./data:/data
+      - ./logs:/logs
+    environment:
+      CACHE_BACKEND: memory
+      RECIPE_METADATA_PATH: /data/recipe_metadata.json
+      RECOMMENDATIONS_PATH: /data/recommendations.json
+      LOG_DIR: /logs
+      PORT: 8000
+
+  # ---------------------------------------------------------------------------
+  # Evaluation / Load Testing
+  # ---------------------------------------------------------------------------
+  evaluation:
+    build: ./evaluation
+    volumes:
+      - ./results:/results
+    environment:
+      BASELINE_URL: http://api-memory:8000
+      OPTIMIZED_URL: http://api:8000
+      BENCHMARK_DURATION: 30
+      USER_POOL_SIZE: 1000
+      OUTPUT_DIR: /results
+    depends_on:
+      - api
+      - api-memory
