@@ -57,7 +57,6 @@ def load_data(config):
     interactions_val_df = pd.read_csv(f"{data_path}/interactions_validation.csv")
     interactions_test_df = pd.read_csv(f"{data_path}/interactions_test.csv")
 
-    # filter to positive interactions only
     threshold = config["positive_rating_threshold"]
     interactions_train_df = interactions_train_df[interactions_train_df['rating'] >= threshold].reset_index(drop=True)
     interactions_val_df = interactions_val_df[interactions_val_df['rating'] >= threshold].reset_index(drop=True)
@@ -65,7 +64,6 @@ def load_data(config):
 
     interactions_df = pd.concat([interactions_train_df, interactions_val_df, interactions_test_df], ignore_index=True)
 
-    # filter out sparse users
     rating_counts = interactions_df.groupby('u').size()
     active_users = set(rating_counts[rating_counts >= config["min_ratings_per_user"]].index)
     before_count = len(interactions_df)
@@ -248,22 +246,13 @@ def evaluate(model, loader, device):
 
 
 def train(config):
-    # set up mlflow
     mlflow.set_experiment(config["mlflow_experiment"])
 
-    # load data
     recipes_df, users_df, interactions_df, interactions_train_df, interactions_val_df, interactions_test_df = load_data(config)
-
-    # build features
     recipe_feat, user_feat, recipe_feat_dim = build_features(recipes_df, users_df, config)
-
-    # build graph
     data, num_users, num_recipes = build_graph(recipes_df, users_df, interactions_df, recipe_feat, user_feat)
-
-    # build loaders
     train_loader, val_loader, test_loader = build_loaders(data, config)
 
-    # device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
@@ -277,8 +266,10 @@ def train(config):
         mlflow.log_param("min_ratings_per_user", config["min_ratings_per_user"])
         mlflow.log_param("positive_rating_threshold", config["positive_rating_threshold"])
         mlflow.log_param("device", str(device))
+        mlflow.log_param("cpu_count", os.cpu_count())
+        mlflow.log_param("gpu_available", torch.cuda.is_available())
+        mlflow.log_param("gpu_name", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A")
 
-        # build model
         model = Model(
             hidden_channels=config["hidden_channels"],
             recipe_feat_dim=recipe_feat_dim,
@@ -286,13 +277,14 @@ def train(config):
         ).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
 
-        # train
         start = time.time()
         best_val_auc = 0
 
         for epoch in range(1, config["num_epochs"] + 1):
+            epoch_start = time.time()
             model.train()
             total_loss = total_examples = 0
+
             for sampled_data in tqdm.tqdm(train_loader, desc=f"Epoch {epoch:02d}"):
                 optimizer.zero_grad()
                 sampled_data = sampled_data.to(device)
@@ -306,23 +298,22 @@ def train(config):
 
             val_auc, val_ap = evaluate(model, val_loader, device)
             epoch_loss = total_loss / total_examples
+            epoch_time = round(time.time() - epoch_start, 2)
 
             mlflow.log_metric("val_auc", val_auc, step=epoch)
             mlflow.log_metric("val_ap", val_ap, step=epoch)
             mlflow.log_metric("loss", epoch_loss, step=epoch)
+            mlflow.log_metric("epoch_time_sec", epoch_time, step=epoch)
 
-            print(f"Epoch {epoch:02d} | Loss: {epoch_loss:.4f} | Val AUC: {val_auc:.4f} | Val AP: {val_ap:.4f}")
+            print(f"Epoch {epoch:02d} | Loss: {epoch_loss:.4f} | Val AUC: {val_auc:.4f} | Val AP: {val_ap:.4f} | Time: {epoch_time}s")
 
             if val_auc > best_val_auc:
                 best_val_auc = val_auc
                 torch.save(model.state_dict(), config["model_output_path"])
 
         train_time = time.time() - start
-
-        # test evaluation
         test_auc, test_ap = evaluate(model, test_loader, device)
 
-        # log final metrics
         mlflow.log_metric("best_val_auc", best_val_auc)
         mlflow.log_metric("test_auc", test_auc)
         mlflow.log_metric("test_ap", test_ap)
