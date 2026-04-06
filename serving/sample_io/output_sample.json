@@ -1,0 +1,16 @@
+{
+  "user_id": "user:13751",
+  "recommendations": [
+    {"recipe_id": "170078", "predicted_score": 6.1618, "name": "pasta ham salad", "tags": ["ham", "30-minutes-or-less", "salads", "pasta", "easy"]},
+    {"recipe_id": "420038", "predicted_score": 5.7851, "name": "easy chicken luau", "tags": ["30-minutes-or-less", "main-dish", "chicken", "easy"]},
+    {"recipe_id": "295844", "predicted_score": 4.6855, "name": "ricotta stuffed shells", "tags": ["main-dish", "pasta", "vegetarian", "kid-friendly"]},
+    {"recipe_id": "363365", "predicted_score": 4.6268, "name": "pork chops in dill cream", "tags": ["60-minutes-or-less", "pork", "easy", "low-carb"]},
+    {"recipe_id": "174377", "predicted_score": 4.1371, "name": "rhubarb meringue squares", "tags": ["desserts", "healthy", "seasonal"]},
+    {"recipe_id": "428583", "predicted_score": 4.0943, "name": "easy cake mix cookie chocolate chocolate chip", "tags": ["15-minutes-or-less", "desserts", "easy", "beginner-cook"]},
+    {"recipe_id": "122174", "predicted_score": 3.7651, "name": "pan de sal filipino bread rolls", "tags": ["healthy", "breads", "asian", "filipino"]},
+    {"recipe_id": "96442", "predicted_score": 3.6808, "name": "grilled bratwurst and beer", "tags": ["60-minutes-or-less", "pork", "barbecue", "summer"]},
+    {"recipe_id": "151024", "predicted_score": 3.3344, "name": "southwest chicken burgers", "tags": ["30-minutes-or-less", "chicken", "spicy", "sandwiches"]},
+    {"recipe_id": "254655", "predicted_score": 3.2068, "name": "spicy black bean stuffed butternut squash", "tags": ["vegetables", "easy", "squash"]}
+  ],
+  "served_at": "2026-04-04T19:06:36.671217+00:00"
+}
