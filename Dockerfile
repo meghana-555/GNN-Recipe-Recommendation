@@ -23,12 +23,13 @@ RUN pip install --no-cache-dir \
     numpy==1.24.3 \
     scikit-learn==1.2.2 \
     mlflow==2.3.1 \
-    tqdm
+    tqdm \
+    boto3
 
 # Copy training script
 COPY train.py .
 
-# Copy data folder
+# Copy data folder (static files: PP_recipes, PP_users, val/test interactions)
 COPY data/ ./data/
 
 # Run training

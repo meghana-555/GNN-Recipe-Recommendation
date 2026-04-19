@@ -1,13 +1,15 @@
-#!/usr/bin/env python
-# coding: utf-8
 
 import os
 import ast
+import io
 import time
 import tqdm
 import numpy as np
 import pandas as pd
 from collections import Counter
+
+import boto3
+from botocore.client import Config
 
 import torch
 import torch.nn.functional as F
@@ -39,23 +41,101 @@ CONFIG = {
     "min_ratings_per_user": 5,
     "positive_rating_threshold": 4,
     "top_k_ingredients": 500,
-    "data_path": "./data",
     "model_output_path": "./best_model.pt",
     "mlflow_experiment": "mealie-gnn-recommendations",
     "run_name": "v1_best",
+    # Object storage config
+    "bucket_name": "ObjStore_proj14",
+    "endpoint_url": "https://chi.tacc.chameleoncloud.org:7480",
+    # Local fallback data path (used if object storage fails)
+    "local_data_path": "./data",
+    # Where to save model in object storage
+    "model_s3_key": "training/best_model.pt",
 }
 # ──────────────────────────────────────────────────────────────────────────────
 
+
+def get_s3_client(config):
+    """Create S3 client for Chameleon object storage."""
+    access_key = os.getenv("CHAMELEON_ACCESS_KEY")
+    secret_key = os.getenv("CHAMELEON_SECRET_KEY")
+
+    if not access_key or not secret_key:
+        raise ValueError("CHAMELEON_ACCESS_KEY and CHAMELEON_SECRET_KEY env vars must be set!")
+
+    return boto3.client(
+        's3',
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        endpoint_url=config["endpoint_url"],
+        config=Config(signature_version='s3v4'),
+        region_name='us-east-1'
+    )
+
+
+def get_latest_train_csv(s3, config):
+    """Find and download the latest training CSV from object storage."""
+    paginator = s3.get_paginator('list_objects_v2')
+    train_files = []
+
+    for page in paginator.paginate(Bucket=config["bucket_name"], Prefix="train/"):
+        for obj in page.get('Contents', []):
+            if obj['Key'].endswith('.csv'):
+                train_files.append(obj['Key'])
+
+    if not train_files:
+        raise Exception("No training CSV found in object storage under train/")
+
+    latest = sorted(train_files)[-1]
+    print(f"Loading training data from object storage: {latest}")
+
+    obj = s3.get_object(Bucket=config["bucket_name"], Key=latest)
+    df = pd.read_csv(io.BytesIO(obj['Body'].read()))
+    return df
+
+
+def save_model_to_s3(s3, config):
+    """Upload trained model to object storage."""
+    print(f"Uploading model to object storage: {config['model_s3_key']}")
+    s3.upload_file(
+        config["model_output_path"],
+        config["bucket_name"],
+        config["model_s3_key"]
+    )
+    print(f"Model uploaded to {config['bucket_name']}/{config['model_s3_key']}")
+
+
 def load_data(config):
-    data_path = config["data_path"]
     print("Loading data...")
 
-    recipes_df = pd.read_csv(f"{data_path}/PP_recipes.csv")
-    users_df = pd.read_csv(f"{data_path}/PP_users.csv")
+    # Try object storage first, fall back to local CSV
+    try:
+        s3 = get_s3_client(config)
+        print("Connected to object storage successfully!")
 
-    interactions_train_df = pd.read_csv(f"{data_path}/interactions_train.csv")
-    interactions_val_df = pd.read_csv(f"{data_path}/interactions_validation.csv")
-    interactions_test_df = pd.read_csv(f"{data_path}/interactions_test.csv")
+        # Load training interactions from object storage
+        interactions_df = get_latest_train_csv(s3, config)
+        print(f"Loaded {len(interactions_df)} interactions from object storage")
+
+        # Load recipe and user metadata from local data folder
+        # (these are static files that don't change)
+        data_path = config["local_data_path"]
+        recipes_df = pd.read_csv(f"{data_path}/PP_recipes.csv")
+        users_df = pd.read_csv(f"{data_path}/PP_users.csv")
+        interactions_val_df = pd.read_csv(f"{data_path}/interactions_validation.csv")
+        interactions_test_df = pd.read_csv(f"{data_path}/interactions_test.csv")
+        interactions_train_df = interactions_df  # from object storage
+
+    except Exception as e:
+        print(f"Object storage failed: {e}")
+        print("Falling back to local CSV files...")
+
+        data_path = config["local_data_path"]
+        recipes_df = pd.read_csv(f"{data_path}/PP_recipes.csv")
+        users_df = pd.read_csv(f"{data_path}/PP_users.csv")
+        interactions_train_df = pd.read_csv(f"{data_path}/interactions_train.csv")
+        interactions_val_df = pd.read_csv(f"{data_path}/interactions_validation.csv")
+        interactions_test_df = pd.read_csv(f"{data_path}/interactions_test.csv")
 
     threshold = config["positive_rating_threshold"]
     interactions_train_df = interactions_train_df[interactions_train_df['rating'] >= threshold].reset_index(drop=True)
@@ -64,6 +144,7 @@ def load_data(config):
 
     interactions_df = pd.concat([interactions_train_df, interactions_val_df, interactions_test_df], ignore_index=True)
 
+    # cold start safeguard - filter users with enough ratings
     rating_counts = interactions_df.groupby('u').size()
     active_users = set(rating_counts[rating_counts >= config["min_ratings_per_user"]].index)
     before_count = len(interactions_df)
@@ -76,6 +157,10 @@ def load_data(config):
     print(f"Users (with >= {config['min_ratings_per_user']} ratings): {len(active_users)}")
     print(f"Positive interactions: {len(interactions_df)} (dropped {before_count - len(interactions_df)} from sparse users)")
     print(f"  Train: {len(interactions_train_df)}, Val: {len(interactions_val_df)}, Test: {len(interactions_test_df)}")
+
+    # cold start warning
+    if len(active_users) == 0:
+        raise Exception("No active users found! Check data pipeline.")
 
     return recipes_df, users_df, interactions_df, interactions_train_df, interactions_val_df, interactions_test_df
 
@@ -257,7 +342,6 @@ def train(config):
     print(f"Device: {device}")
 
     with mlflow.start_run(run_name=config["run_name"]):
-        # log config
         mlflow.log_param("model", "GraphSAGE")
         mlflow.log_param("hidden_channels", config["hidden_channels"])
         mlflow.log_param("num_epochs", config["num_epochs"])
@@ -269,6 +353,7 @@ def train(config):
         mlflow.log_param("cpu_count", os.cpu_count())
         mlflow.log_param("gpu_available", torch.cuda.is_available())
         mlflow.log_param("gpu_name", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A")
+        mlflow.log_param("data_source", "object_storage" if os.getenv("CHAMELEON_ACCESS_KEY") else "local_csv")
 
         model = Model(
             hidden_channels=config["hidden_channels"],
@@ -319,6 +404,14 @@ def train(config):
         mlflow.log_metric("test_ap", test_ap)
         mlflow.log_metric("train_time_sec", round(train_time, 2))
         mlflow.log_artifact(config["model_output_path"])
+
+        # save model to object storage
+        try:
+            s3 = get_s3_client(config)
+            save_model_to_s3(s3, config)
+            mlflow.log_param("model_s3_path", f"{config['bucket_name']}/{config['model_s3_key']}")
+        except Exception as e:
+            print(f"Warning: Could not upload model to object storage: {e}")
 
         print(f"\nTraining done!")
         print(f"Best Val AUC: {best_val_auc:.4f}")
