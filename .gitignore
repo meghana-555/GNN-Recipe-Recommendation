@@ -2,3 +2,20 @@
 *.pt
 __pycache__/
 *.pyc
+
+# Environment & Credentials
+.env
+
+# Data Pipeline temporary & cache
+local_data/
+*.parquet
+
+# Jupyter Notebook Caches
+.ipynb_checkpoints/
+
+# Serving Logs & Evaluation Results
+logs/
+results/
+
+__pycache__/
+*.pyc
