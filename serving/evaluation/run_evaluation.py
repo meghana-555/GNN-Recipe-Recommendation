@@ -35,6 +35,7 @@ Usage::
     OPTIMIZED_URL=http://optimized:8000 \
     python run_evaluation.py
 """
+# Assisted by Claude
 
 from __future__ import annotations
 
@@ -59,20 +60,12 @@ from benchmark import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Defaults from environment
-# ---------------------------------------------------------------------------
-
 _DEFAULT_BASELINE = os.environ.get("BASELINE_URL", "")
 _DEFAULT_OPTIMIZED = os.environ.get("OPTIMIZED_URL", "")
 _DEFAULT_FURTHER = os.environ.get("FURTHER_URL", "")
 _DEFAULT_OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "./results")
 _DEFAULT_DURATION = int(os.environ.get("BENCHMARK_DURATION", str(DURATION_SECONDS)))
 
-
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -119,10 +112,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-# ---------------------------------------------------------------------------
-# Health-check phase
-# ---------------------------------------------------------------------------
-
 async def verify_endpoints(
     options: list[tuple[str, str]],
     *,
@@ -151,10 +140,6 @@ async def verify_endpoints(
 
     return healthy
 
-
-# ---------------------------------------------------------------------------
-# Main orchestration
-# ---------------------------------------------------------------------------
 
 async def orchestrate(args: argparse.Namespace) -> list[BenchmarkResult]:
     """Run the full evaluation pipeline and return collected results."""

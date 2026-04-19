@@ -7,6 +7,7 @@ Supports two backends:
 Values are stored and returned as raw JSON strings so the caller is
 responsible for serialisation.
 """
+# Assisted by Claude
 
 from __future__ import annotations
 
@@ -16,10 +17,6 @@ from typing import Any, Optional
 
 import redis.asyncio as aioredis
 
-
-# ---------------------------------------------------------------------------
-# Abstract base
-# ---------------------------------------------------------------------------
 
 class CacheBackend(ABC):
     """Minimal async-compatible cache interface."""
@@ -32,10 +29,6 @@ class CacheBackend(ABC):
     async def set(self, key: str, value: str) -> None:  # noqa: A003
         """Store a JSON string under *key*."""
 
-
-# ---------------------------------------------------------------------------
-# Redis implementation
-# ---------------------------------------------------------------------------
 
 class RedisCache(CacheBackend):
     """Thin async wrapper around a Redis connection."""
@@ -57,10 +50,6 @@ class RedisCache(CacheBackend):
         await self._client.aclose()
 
 
-# ---------------------------------------------------------------------------
-# In-memory implementation
-# ---------------------------------------------------------------------------
-
 class MemoryCache(CacheBackend):
     """Simple dict-backed cache — no TTL, no eviction."""
 
@@ -79,10 +68,6 @@ class MemoryCache(CacheBackend):
         for k, v in data.items():
             self._store[k] = v if isinstance(v, str) else json.dumps(v)
 
-
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
 
 def create_cache(backend_type: str, **kwargs: Any) -> CacheBackend:
     """Instantiate the requested cache backend.

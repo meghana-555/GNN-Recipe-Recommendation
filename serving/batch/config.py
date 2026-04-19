@@ -3,6 +3,7 @@ Configuration for the batch pre-computation pipeline.
 
 All settings are read from environment variables with sensible defaults.
 """
+# Assisted by Claude
 
 import os
 
@@ -39,3 +40,12 @@ TRAIN_BATCH_SIZE: int = int(os.environ.get("TRAIN_BATCH_SIZE", "128"))
 NUM_NEIGHBORS: list = [20, 10]
 NEG_SAMPLING_RATIO: float = 2.0
 TOP_K_INGREDIENTS: int = 500
+
+# Append-only audit of every batch invocation. Monitoring and canary tooling
+# tail this file to know which version is currently serving, so it must be
+# configurable per deployment (docker volume, host path, etc.).
+BATCH_RUN_LOG: str = os.environ.get("BATCH_RUN_LOG", "/logs/batch_run.jsonl")
+
+# MODEL_DIR lives next to the checkpoint; current_version.txt is written here
+# so the serving side can resolve which artifact set it is loading.
+MODEL_DIR: str = os.path.dirname(MODEL_PATH) or "/models"

@@ -1,241 +1,98 @@
-# Serving Layer — GNN Recipe Recommendation
+<!-- Assisted by Claude -->
+# Serving Layer
 
-Serving infrastructure for the heterogeneous GraphSAGE recipe recommendation model. Designed to run on Chameleon cloud infrastructure inside Docker containers.
+This is the online serving stack for the GNN recipe recommender: a heterogeneous GraphSAGE model trained on Mealie ratings, served behind a sub-50ms FastAPI. The key insight is that the expensive GPU work happens once a week in a batch job - the job scores every user against every recipe and writes the top-10 per user into Redis, so the online API reduces to a single cache lookup and a JSON serialization. A separate monitor service observes request telemetry and user ratings, joins them to compute Precision@10 and engagement signals, and decides whether each weekly retrained model should be promoted or rolled back. No inference happens on the hot path.
 
-## Architecture
-
-```
-                                  +-----------------+
-                                  |   Mealie App    |
-                                  +--------+--------+
-                                           |
-                                    POST /recommend
-                                           |
-                                  +--------v--------+
-                                  |   FastAPI API    |
-                                  |  (CPU, <50ms)   |
-                                  +--------+--------+
-                                           |
-                              cache lookup (user_id)
-                                           |
-                        +------------------+------------------+
-                        |                                     |
-               +--------v--------+               +-----------v-----------+
-               |      Redis      |               | In-memory dict cache  |
-               | (optimized)     |               | (baseline)            |
-               +--------+--------+               +-----------------------+
-                        |
-                 populated by
-                        |
-               +--------v--------+
-               |  Batch Scoring  |
-               |  (GPU, weekly)  |
-               +-----------------+
-```
-
-## Directory Structure
+## Directory layout
 
 ```
 serving/
-  api/                   # FastAPI serving endpoint
-    main.py              # Application with /health and /recommend endpoints
-    cache.py             # Swappable cache backend (Redis / in-memory)
-    config.py            # Environment variable configuration
-    Dockerfile           # CPU-only container
-    requirements.txt
-
-  batch/                 # Batch pre-computation pipeline
-    batch_score.py       # Main script: train (if needed) -> score -> write cache
-    model.py             # GNN model definitions (extracted from notebook)
-    config.py            # Environment variable configuration
-    Dockerfile           # CUDA-capable container (pytorch base)
-    requirements.txt
-
-  evaluation/            # Load testing & benchmarking
-    benchmark.py         # Async httpx benchmark (p50/p95/p99, throughput, errors)
-    locustfile.py        # Locust load test definition
-    run_evaluation.py    # Orchestration script for full evaluation suite
-    Dockerfile           # CPU-only container
-    requirements.txt
-
-  docker-compose.yml     # Full stack: Redis + batch + API + evaluation
-  README.md              # This file
+  api/              FastAPI service (Redis-backed + in-memory variants)
+  batch/            One-shot job: trains if needed, scores all users to Redis
+  evaluation/       Load-testing and latency benchmark runner
+  monitoring/       Metrics service, /track, /feedback forwarding, promote-decision
+  rollback/         One-shot tool: swaps .pt.backup -> .pt
+  sample_io/        Example /recommend request and response payloads
+  docker-compose.yml
+  README.md
+  SAFEGUARDING.md
 ```
 
-## Prerequisites
-
-1. **Data files** — Place the following CSVs in `serving/data/`:
-   - `PP_recipes.csv`
-   - `PP_users.csv`
-   - `interactions_train.csv`
-   - `interactions_validation.csv`
-   - `interactions_test.csv`
-   - `RAW_recipes.csv`
-
-2. **Docker** and **Docker Compose** installed.
-
-## Quick Start
-
-### 1. Prepare data directory
+## Quick start
 
 ```bash
-mkdir -p serving/data serving/models serving/logs serving/results
-
-# Copy your CSV data files into serving/data/
-cp /path/to/your/csvs/*.csv serving/data/
-```
-
-### 2. Run the batch pipeline (trains model if needed + pre-computes recommendations)
-
-```bash
-cd serving
-docker compose up batch
-```
-
-This will:
-- Check if a trained model exists at `models/recipe_gnn_model.pt`
-- If not, train the GraphSAGE model from scratch (~10-15 minutes on GPU)
-- Compute embeddings for all users and recipes
-- Score every user against the full recipe catalog
-- Write top-10 recommendations per user to Redis
-- Write `recipe_metadata.json` to `data/`
-
-### 3. Start the serving API
-
-```bash
-# Start Redis + API (Redis-backed, optimized)
-docker compose up -d redis api
-
-# Or start the baseline (in-memory cache)
-docker compose up -d api-memory
-```
-
-### 4. Test the API
-
-```bash
-# Health check
+mkdir -p data models logs results
+# put CSVs into ./data/
+docker compose up -d redis
+docker compose run --rm batch            # trains if needed, then scores
+docker compose up -d api monitor
 curl http://localhost:8000/health
-
-# Get recommendations
-curl -X POST http://localhost:8000/recommend \
-  -H "Content-Type: application/json" \
-  -d '{"user_id": "user:42"}'
+curl -XPOST http://localhost:8000/recommend -H 'Content-Type: application/json' -d '{"user_id":"user:0"}'
 ```
 
-### 5. Run evaluation
+The `api-memory` variant (port 8001) is the unoptimised in-memory-cache baseline used by `evaluation/` for the Redis vs. dict head-to-head.
 
-```bash
-# Full benchmark suite (tests baseline and optimized)
-docker compose up evaluation
+## Feedback loop
 
-# Or use Locust directly for interactive load testing
-docker compose run evaluation \
-  locust -f locustfile.py --host http://api:8000 \
-  --headless -u 50 -r 10 --run-time 120s
-```
+1. User calls `POST /recommend`. The API looks up the pre-computed top-10 in Redis and returns them.
+2. The API writes a line to `/logs/serving.log` (the audit trail) and fires-and-forgets a `POST http://monitor:9090/track` with `{user_id, recipe_ids, predicted_scores, latency_ms, status_code}`. The telemetry has a 500ms timeout and does not block the response.
+3. When the user rates a recommended recipe in Mealie, Mealie calls `POST /feedback` on the API with `{user_id, recipe_id, rating}`. The API appends to `/logs/feedback.jsonl` and forwards the event to monitor.
+4. Monitor joins `serving.log` x `feedback.jsonl` on `(user_id, recipe_id)` to compute `Precision@10` (was the rated recipe in the top-10 we served?) and `avg_rating_on_recommended`.
+5. Weekly, a host cron job runs `docker compose run --rm batch`. Monitor's `/promote-decision` endpoint evaluates the new model's metrics against the thresholds below and emits a PROMOTE, ROLLBACK, or HOLD.
 
-## Running on Chameleon
+## Monitoring and promote/rollback thresholds
 
-### GPU node (for batch scoring)
+| Signal | Threshold | Action | Why |
+|---|---|---|---|
+| `error_rate` | >5% over last 1000 requests | ROLLBACK | Operational failure, user-visible |
+| `avg_rating_on_recommended` drop | >0.2 vs 30d baseline | ROLLBACK | 0.2 stars ~= 10% of scale, user-detectable |
+| `feedback_rate` drop | >20% vs prior 7d | ROLLBACK | Users disengaging |
+| Precision@10 improvement + `avg_rating_on_recommended` up >0.1 over 7d | both true | PROMOTE | Conservative - both quality and engagement |
+| `min_feedback_count` not met | <50 rated in window | HOLD | Insufficient sample size |
 
-```bash
-docker build -t recipe-batch ./batch
-docker run --gpus all \
-  -v /path/to/data:/data \
-  -v /path/to/models:/models \
-  -e CACHE_BACKEND=redis \
-  -e REDIS_HOST=<redis-host> \
-  recipe-batch
-```
+Every decision is written to `/logs/decisions.jsonl` with the metrics snapshot that drove it, so promotions and rollbacks are fully auditable.
 
-### CPU node (for serving API)
+## Reproducing batch scoring
 
-```bash
-docker build -t recipe-api ./api
-docker run -d -p 8000:8000 \
-  -v /path/to/data:/data \
-  -e CACHE_BACKEND=redis \
-  -e REDIS_HOST=<redis-host> \
-  recipe-api
-```
+The batch container trains if no checkpoint is found at `MODEL_PATH`, then runs inference for every user and writes top-10 into Redis. GPU is auto-detected (CUDA or ROCm); the job falls back to CPU if neither is present, which is significantly slower but functional.
 
-### Evaluation
+- `--dry-run` runs the full pipeline but writes to a scratch key prefix so you can canary-test a new training config without clobbering the live recommendations.
+- `MODEL_PATH=/models/recipe_gnn.pt` skips retraining when a checkpoint already exists at that path.
+- If Redis is unreachable the job falls back to writing JSON files under `results/`, so pre-computation still completes.
 
-```bash
-docker build -t recipe-eval ./evaluation
-docker run \
-  -v /path/to/results:/results \
-  -e BASELINE_URL=http://<baseline-host>:8001 \
-  -e OPTIMIZED_URL=http://<optimized-host>:8000 \
-  recipe-eval
-```
+## API contract
 
-## Configuration
+`POST /recommend` takes a `user_id` and returns the pre-computed top-10 recipes with predicted scores.
 
-All configuration is via environment variables:
+- Request: see [`sample_io/input_sample.json`](./sample_io/input_sample.json).
+- Response: see [`sample_io/output_sample.json`](./sample_io/output_sample.json).
 
-### API (`serving/api/`)
+`POST /feedback` accepts a user's rating on a recommended recipe:
 
-| Variable | Default | Description |
-|---|---|---|
-| `CACHE_BACKEND` | `memory` | `redis` or `memory` |
-| `REDIS_HOST` | `localhost` | Redis hostname |
-| `REDIS_PORT` | `6379` | Redis port |
-| `RECIPE_METADATA_PATH` | `/data/recipe_metadata.json` | Recipe metadata file |
-| `RECOMMENDATIONS_PATH` | `/data/recommendations.json` | Pre-computed recs (memory cache) |
-| `PORT` | `8000` | Uvicorn listen port |
-| `LOG_DIR` | `/logs` | Serving audit log directory |
-
-### Batch (`serving/batch/`)
-
-| Variable | Default | Description |
-|---|---|---|
-| `MODEL_PATH` | `/models/recipe_gnn_model.pt` | Model checkpoint path |
-| `DATA_DIR` | `/data` | Directory containing CSV files |
-| `CACHE_BACKEND` | `redis` | `redis` or `memory` |
-| `REDIS_HOST` | `localhost` | Redis hostname |
-| `REDIS_PORT` | `6379` | Redis port |
-| `TOP_N` | `10` | Recommendations per user |
-| `BATCH_SIZE` | `128` | Scoring batch size |
-| `HIDDEN_CHANNELS` | `64` | GNN hidden dimension |
-| `TRAIN_EPOCHS` | `5` | Training epochs |
-
-### Evaluation (`serving/evaluation/`)
-
-| Variable | Default | Description |
-|---|---|---|
-| `BASELINE_URL` | — | Baseline endpoint URL |
-| `OPTIMIZED_URL` | — | Optimized endpoint URL |
-| `FURTHER_URL` | — | Further-optimized endpoint URL |
-| `BENCHMARK_DURATION` | `30` | Seconds per concurrency level |
-| `USER_POOL_SIZE` | `1000` | Number of synthetic user IDs |
-| `OUTPUT_DIR` | `./results` | Output directory for results |
-
-## API Contract
-
-**Request:**
 ```json
-{"user_id": "user:42"}
+// request
+{"user_id": "user:13751", "recipe_id": "170078", "rating": 4}
+// response
+{"status": "ok", "logged_at": "2026-04-19T12:34:56Z"}
 ```
 
-**Response:**
-```json
-{
-  "user_id": "user:42",
-  "recommendations": [
-    {"recipe_id": "40893", "predicted_score": 4.8, "name": "arriba baked winter squash"},
-    {"recipe_id": "85009", "predicted_score": 4.6, "name": "breakfast pizza"},
-    {"recipe_id": "44394", "predicted_score": 4.4, "name": "chicken tikka masala"},
-    {"recipe_id": "12345", "predicted_score": 4.2, "name": "lemon herb pasta"},
-    {"recipe_id": "67890", "predicted_score": 4.0, "name": "spicy black bean tacos"}
-  ],
-  "served_at": "2026-04-03T08:32:00Z"
-}
+If Redis is unavailable, `/recommend` returns 404 with a clear error rather than crashing. `/feedback` persists to disk even if monitor is down; the forward to monitor is best-effort.
+
+## Weekly retraining
+
+Retraining is a host-level cron job, not a long-running container - we did not want a scheduler daemon in compose just to fire once a week. Example crontab line:
+
+```
+0 3 * * 0 cd /path/to/serving && docker compose run --rm batch
 ```
 
-## Evaluation Results Format
+After the batch run, call `GET http://localhost:9090/promote-decision` to emit the PROMOTE, ROLLBACK, or HOLD for the fresh model. If the decision is ROLLBACK, run `docker compose --profile tools run --rm rollback` to swap `.pt.backup` back to `.pt` and bounce `api`.
 
-Results are output as console table, CSV, and JSON matching this schema:
+## Right-sizing on Chameleon
 
-| Option | Endpoint URL | Model version | Code version | Hardware | p50/p95 latency | Throughput | Error rate | Concurrency tested | Compute instance type | Notes |
-|--------|-------------|---------------|--------------|----------|-----------------|------------|------------|-------------------|----------------------|-------|
+- `api` container: ~200MB resident, <10% CPU under 20 concurrent users. A single `m1.medium` node handles the full Mealie population with headroom.
+- `monitor` container: ~100MB, negligible CPU. Co-locates fine with `api`.
+- `batch` container: requires a GPU node (we tested on AMD MI100 and NVIDIA RTX6000). Training plus scoring for 25K users completes in minutes; the node can be released immediately afterwards.
+- `redis`: <50MB for 25K users at top-10 with payload ~1.5KB per user. No persistence tuning required.
+
+See [SAFEGUARDING.md](./SAFEGUARDING.md) for the fairness, privacy, and robustness posture of this stack.

@@ -5,6 +5,7 @@ Contains the heterogeneous GraphSAGE model, dot-product classifier,
 and the combined Model class -- extracted verbatim from the training
 notebook with RECIPE_FEAT_DIM made a constructor parameter.
 """
+# Assisted by Claude
 
 import typing
 
@@ -14,11 +15,9 @@ from torch import Tensor
 from torch_geometric.data import HeteroData
 from torch_geometric.nn import SAGEConv, to_hetero
 
-# ---------------------------------------------------------------------------
 # Compatibility shim: PyTorch >= 2.8 removed symbols from
 # torch.fx._symbolic_trace that PyG 2.6.x still references inside
 # to_hetero().  Patch them back so the conversion does not crash.
-# ---------------------------------------------------------------------------
 import torch.fx._symbolic_trace as _st
 
 if not hasattr(_st, "List"):
@@ -28,10 +27,6 @@ if not hasattr(_st, "Dict"):
 if not hasattr(_st, "Optional"):
     _st.Optional = typing.Optional
 
-
-# ---------------------------------------------------------------------------
-# Model components
-# ---------------------------------------------------------------------------
 
 class GNN(torch.nn.Module):
     """Two-layer homogeneous GraphSAGE backbone."""

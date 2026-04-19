@@ -24,6 +24,7 @@ CODE_VERSION         : label for the code column  (default "HEAD")
 HARDWARE             : hardware description       (default "cpu")
 COMPUTE_INSTANCE     : cloud instance type         (default "chameleon-m1.medium")
 """
+# Assisted by Claude
 
 from __future__ import annotations
 
@@ -43,10 +44,6 @@ import numpy as np
 from tabulate import tabulate
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
 CONCURRENCY_LEVELS: list[int] = [1, 5, 10, 20]
 
 DURATION_SECONDS: int = int(os.environ.get("BENCHMARK_DURATION", "30"))
@@ -57,10 +54,6 @@ HARDWARE: str = os.environ.get("HARDWARE", "cpu")
 COMPUTE_INSTANCE: str = os.environ.get("COMPUTE_INSTANCE", "chameleon-m1.medium")
 REQUEST_TIMEOUT: float = float(os.environ.get("REQUEST_TIMEOUT", "10.0"))
 
-
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
 
 @dataclass
 class RequestResult:
@@ -94,10 +87,6 @@ class BenchmarkResult:
     compute_instance: str = COMPUTE_INSTANCE
     notes: str = ""
 
-
-# ---------------------------------------------------------------------------
-# Worker coroutine
-# ---------------------------------------------------------------------------
 
 async def _worker(
     client: httpx.AsyncClient,
@@ -142,10 +131,6 @@ async def _worker(
         # check the stop event promptly.
         await asyncio.sleep(0)
 
-
-# ---------------------------------------------------------------------------
-# Run a single benchmark pass
-# ---------------------------------------------------------------------------
 
 async def run_benchmark(
     option_name: str,
@@ -224,10 +209,6 @@ async def run_benchmark(
     )
 
 
-# ---------------------------------------------------------------------------
-# Health check helper
-# ---------------------------------------------------------------------------
-
 async def check_health(base_url: str, retries: int = 3) -> bool:
     """Return True if the /health endpoint reports healthy."""
     async with httpx.AsyncClient() as client:
@@ -244,10 +225,6 @@ async def check_health(base_url: str, retries: int = 3) -> bool:
                 await asyncio.sleep(1)
     return False
 
-
-# ---------------------------------------------------------------------------
-# Output helpers
-# ---------------------------------------------------------------------------
 
 def _table_row(r: BenchmarkResult) -> dict:
     """Return a dict suitable for tabulate display."""
@@ -299,10 +276,6 @@ def save_json(results: list[BenchmarkResult], path: str) -> None:
         json.dump(payload, fh, indent=2)
     print(f"[benchmark] JSON saved to {path}")
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(

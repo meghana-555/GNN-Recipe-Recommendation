@@ -1,19 +1,7 @@
-# =============================================================================
-# Docker Compose for the GNN Recipe Recommendation Serving Layer
-#
-# Services:
-#   redis       — Redis cache for pre-computed recommendations
-#   batch       — One-shot job: trains model (if needed) and pre-computes recs
-#   api         — FastAPI serving endpoint (Redis-backed)
-#   api-memory  — FastAPI serving endpoint (in-memory cache, baseline)
-#   evaluation  — Load testing / benchmarking suite
-# =============================================================================
+# Assisted by Claude
 
 services:
 
-  # ---------------------------------------------------------------------------
-  # Redis cache
-  # ---------------------------------------------------------------------------
   redis:
     image: redis:7-alpine
     ports:
@@ -23,19 +11,14 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    restart: unless-stopped
 
-  # ---------------------------------------------------------------------------
-  # Batch pre-computation (one-shot job)
-  #
-  # Mount your CSV data files into /data and the model output dir into /models.
-  # On first run it will train the model (~10-15 min) then score all users.
-  # On subsequent runs it loads the existing model and scores directly.
-  # ---------------------------------------------------------------------------
   batch:
     build: ./batch
     volumes:
       - ./data:/data
       - ./models:/models
+      - ./logs:/logs
     environment:
       MODEL_PATH: /models/recipe_gnn_model.pt
       DATA_DIR: /data
@@ -45,13 +28,12 @@ services:
       TOP_N: 10
       RECIPE_METADATA_OUTPUT: /data/recipe_metadata.json
       RECOMMENDATIONS_OUTPUT: /data/recommendations.json
+      BATCH_RUN_LOG: /logs/batch_run.jsonl
+      MLFLOW_TRACKING_URI: ""
     depends_on:
       redis:
         condition: service_healthy
 
-  # ---------------------------------------------------------------------------
-  # Serving API — Redis cache (optimized)
-  # ---------------------------------------------------------------------------
   api:
     build: ./api
     ports:
@@ -67,13 +49,13 @@ services:
       RECOMMENDATIONS_PATH: /data/recommendations.json
       LOG_DIR: /logs
       PORT: 8000
+      MONITOR_URL: http://monitor:9090
+      FEEDBACK_LOG_PATH: /logs/feedback.jsonl
     depends_on:
       redis:
         condition: service_healthy
+    restart: unless-stopped
 
-  # ---------------------------------------------------------------------------
-  # Serving API — In-memory cache (baseline)
-  # ---------------------------------------------------------------------------
   api-memory:
     build: ./api
     ports:
@@ -87,10 +69,10 @@ services:
       RECOMMENDATIONS_PATH: /data/recommendations.json
       LOG_DIR: /logs
       PORT: 8000
+      MONITOR_URL: http://monitor:9090
+      FEEDBACK_LOG_PATH: /logs/feedback.jsonl
+    restart: unless-stopped
 
-  # ---------------------------------------------------------------------------
-  # Evaluation / Load Testing
-  # ---------------------------------------------------------------------------
   evaluation:
     build: ./evaluation
     volumes:
@@ -104,3 +86,35 @@ services:
     depends_on:
       - api
       - api-memory
+
+  monitor:
+    build: ./monitoring
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./logs:/logs
+      - ./models:/models
+    environment:
+      FEEDBACK_LOG_PATH: /logs/feedback.jsonl
+      SERVING_LOG_PATH: /logs/serving.log
+      DECISIONS_LOG_PATH: /logs/decisions.jsonl
+      MODEL_VERSION_PATH: /models/current_version.txt
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      EXPECTED_USER_COUNT: "0"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/metrics"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  rollback:
+    build: ./rollback
+    volumes:
+      - ./models:/models
+    profiles:
+      - tools

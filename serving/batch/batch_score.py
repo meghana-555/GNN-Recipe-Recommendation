@@ -16,17 +16,22 @@ container or a Kubernetes Job).  It:
        - A ``recipe_metadata.json`` file mapping recipe_id -> {name, tags}
          for the downstream serving API.
 """
+# Assisted by Claude
 
 from __future__ import annotations
 
+import argparse
 import ast
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -39,10 +44,12 @@ from tqdm import tqdm
 
 # Local imports
 from config import (
+    BATCH_RUN_LOG,
     BATCH_SIZE,
     CACHE_BACKEND,
     DATA_DIR,
     HIDDEN_CHANNELS,
+    MODEL_DIR,
     MODEL_PATH,
     NEG_SAMPLING_RATIO,
     NUM_NEIGHBORS,
@@ -58,9 +65,6 @@ from config import (
 )
 from model import Model
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -68,15 +72,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Device selection
-# ---------------------------------------------------------------------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ===================================================================
 # Data loading & feature engineering (mirrors the notebook exactly)
-# ===================================================================
 
 
 def load_interactions(data_dir: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -191,11 +190,6 @@ def build_graph(
         data["user", "rates", "recipe"].edge_index.shape[1],
     )
     return data, num_users, num_recipes
-
-
-# ===================================================================
-# Training
-# ===================================================================
 
 
 def train_model(data_dir: str, model_path: str) -> None:
@@ -320,11 +314,6 @@ def train_model(data_dir: str, model_path: str) -> None:
     log.info("Model saved to %s", model_path)
 
 
-# ===================================================================
-# Embedding extraction
-# ===================================================================
-
-
 def compute_embeddings(
     model: Model, data: HeteroData
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -343,11 +332,6 @@ def compute_embeddings(
         }
         x_dict = model.gnn(x_dict, data_dev.edge_index_dict)
     return x_dict["user"].cpu(), x_dict["recipe"].cpu()
-
-
-# ===================================================================
-# Scoring & writing results
-# ===================================================================
 
 
 def build_rated_set(data: HeteroData) -> dict[int, set[int]]:
@@ -522,14 +506,43 @@ def write_to_json(
     )
 
 
-# ===================================================================
-# Main entry point
-# ===================================================================
+def _resolve_git_rev() -> str:
+    # Env override wins so CI/CD can inject a build SHA even when the container
+    # has no .git directory. Bare subprocess call is cheap and fails silently
+    # for all the usual "not a repo / git not installed" scenarios.
+    override = os.environ.get("GIT_REV")
+    if override:
+        return override
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stderr=subprocess.DEVNULL,
+        ).decode().strip() or "nogit"
+    except Exception:
+        return "nogit"
+
+
+def _append_batch_run(entry: dict) -> None:
+    # Best-effort JSONL append; a broken log must not fail the batch job
+    # because the recommendations are already persisted at this point.
+    try:
+        path = Path(BATCH_RUN_LOG)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as exc:
+        log.warning("Failed to append batch run log to %s: %s", BATCH_RUN_LOG, exc)
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Batch pre-computation for GNN recommender")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Score but skip cache writes (for canary evaluation)")
+    args = parser.parse_args()
+
     t0 = time.time()
-    log.info("Batch scoring pipeline started")
+    log.info("Batch scoring pipeline started (dry_run=%s)", args.dry_run)
     log.info("Device: %s", DEVICE)
     log.info("MODEL_PATH: %s", MODEL_PATH)
     log.info("DATA_DIR: %s", DATA_DIR)
@@ -595,42 +608,68 @@ def main() -> None:
     log.info("Building recipe metadata ...")
     recipe_metadata = build_recipe_metadata(DATA_DIR)
 
-    # Write metadata JSON
-    os.makedirs(
-        os.path.dirname(RECIPE_METADATA_OUTPUT) or ".", exist_ok=True
-    )
-    with open(RECIPE_METADATA_OUTPUT, "w") as f:
-        json.dump(recipe_metadata, f, indent=2)
-    log.info(
-        "Recipe metadata (%d entries) written to %s",
-        len(recipe_metadata),
-        RECIPE_METADATA_OUTPUT,
-    )
-
-    # ------------------------------------------------------------------
-    # Step 6: Write recommendations
-    # ------------------------------------------------------------------
-    # Build graph-index -> original-recipe-id lookup for output
-    recipes_df = pd.read_csv(os.path.join(DATA_DIR, "PP_recipes.csv"))
-    recipe_id_lookup: dict[int, int] = recipes_df.set_index("i")["id"].to_dict()
-
-    if CACHE_BACKEND == "redis":
-        try:
-            write_to_redis(recommendations, recipe_id_lookup, recipe_metadata)
-        except Exception as exc:
-            log.error("Redis write failed: %s", exc)
-            fallback = RECOMMENDATIONS_OUTPUT
-            log.info("Falling back to JSON output at %s", fallback)
-            write_to_json(
-                recommendations, recipe_id_lookup, recipe_metadata, fallback
-            )
-    else:
-        write_to_json(
-            recommendations,
-            recipe_id_lookup,
-            recipe_metadata,
-            RECOMMENDATIONS_OUTPUT,
+    # Skip persistence during dry-run so canary evaluation can measure scoring
+    # behavior (latency, score distribution) without overwriting prod artifacts.
+    version: Optional[str] = None
+    if not args.dry_run:
+        os.makedirs(
+            os.path.dirname(RECIPE_METADATA_OUTPUT) or ".", exist_ok=True
         )
+        with open(RECIPE_METADATA_OUTPUT, "w") as f:
+            json.dump(recipe_metadata, f, indent=2)
+        log.info(
+            "Recipe metadata (%d entries) written to %s",
+            len(recipe_metadata),
+            RECIPE_METADATA_OUTPUT,
+        )
+
+        # ------------------------------------------------------------------
+        # Step 6: Write recommendations
+        # ------------------------------------------------------------------
+        # Build graph-index -> original-recipe-id lookup for output
+        recipes_df = pd.read_csv(os.path.join(DATA_DIR, "PP_recipes.csv"))
+        recipe_id_lookup: dict[int, int] = recipes_df.set_index("i")["id"].to_dict()
+
+        if CACHE_BACKEND == "redis":
+            try:
+                write_to_redis(recommendations, recipe_id_lookup, recipe_metadata)
+            except Exception as exc:
+                log.error("Redis write failed: %s", exc)
+                fallback = RECOMMENDATIONS_OUTPUT
+                log.info("Falling back to JSON output at %s", fallback)
+                write_to_json(
+                    recommendations, recipe_id_lookup, recipe_metadata, fallback
+                )
+        else:
+            write_to_json(
+                recommendations,
+                recipe_id_lookup,
+                recipe_metadata,
+                RECOMMENDATIONS_OUTPUT,
+            )
+
+        # Stamp current_version.txt only on a successful full run; canary
+        # readers treat a stale file as "no new version" and keep the old one.
+        ts_iso = datetime.now(timezone.utc).isoformat()
+        git_rev = _resolve_git_rev()
+        version = f"{ts_iso}\t{git_rev}"
+        try:
+            os.makedirs(MODEL_DIR, exist_ok=True)
+            version_path = os.path.join(MODEL_DIR, "current_version.txt")
+            with open(version_path, "w") as f:
+                f.write(version + "\n")
+            log.info("Wrote version marker to %s", version_path)
+        except Exception as exc:
+            log.warning("Failed to write current_version.txt: %s", exc)
+
+    # Both dry-run and full-run emit a batch_run entry so the monitor can
+    # distinguish canary scoring from production refreshes.
+    _append_batch_run({
+        "version": version,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "num_users_scored": len(recommendations),
+        "dry_run": args.dry_run,
+    })
 
     elapsed = time.time() - t0
     log.info("Batch scoring pipeline completed in %.1f seconds", elapsed)

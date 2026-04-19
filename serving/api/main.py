@@ -5,26 +5,25 @@ in-memory dict).  Recipe metadata (name, tags) is resolved from a JSON file
 produced by the batch pipeline.  No live model inference happens at request
 time, keeping p99 latency well under 50 ms.
 """
+# Assisted by Claude
 
 from __future__ import annotations
 
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+import httpx
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from cache import CacheBackend, MemoryCache, RedisCache, create_cache
 from config import settings
-
-# ---------------------------------------------------------------------------
-# Logging setup
-# ---------------------------------------------------------------------------
 
 LOG_DIR = Path(settings.LOG_DIR)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -52,10 +51,6 @@ _console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s
 logger.addHandler(_console)
 
 
-# ---------------------------------------------------------------------------
-# Pydantic request / response models
-# ---------------------------------------------------------------------------
-
 class RecommendRequest(BaseModel):
     user_id: str
 
@@ -73,13 +68,12 @@ class RecommendResponse(BaseModel):
     served_at: str
 
 
-# ---------------------------------------------------------------------------
-# Application state loaded at startup
-# ---------------------------------------------------------------------------
-
 # Populated during the lifespan event
 cache: CacheBackend
 recipe_metadata: Dict[str, Any] = {}
+# Shared async HTTP client for monitor telemetry; pooled to avoid per-request
+# connection setup and to keep fire-and-forget posts under the request budget.
+monitor_client: Optional[httpx.AsyncClient] = None
 
 
 def _load_recipe_metadata() -> Dict[str, Any]:
@@ -105,13 +99,9 @@ def _load_recipe_metadata() -> Dict[str, Any]:
     return data
 
 
-# ---------------------------------------------------------------------------
-# Lifespan: startup / shutdown
-# ---------------------------------------------------------------------------
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global cache, recipe_metadata
+    global cache, recipe_metadata, monitor_client
 
     # 1. Recipe metadata
     recipe_metadata = _load_recipe_metadata()
@@ -123,6 +113,10 @@ async def lifespan(app: FastAPI):
         port=settings.REDIS_PORT,
     )
     logger.info("Cache backend: %s", settings.CACHE_BACKEND)
+
+    # Tight timeout: monitor telemetry must never stall user requests,
+    # so a slow/down monitor falls through quickly instead of piling up.
+    monitor_client = httpx.AsyncClient(timeout=0.5)
 
     # 3. If using in-memory cache, seed from the recommendations JSON produced
     #    by the batch pipeline (if the file exists).
@@ -149,18 +143,41 @@ async def lifespan(app: FastAPI):
     # Teardown
     if isinstance(cache, RedisCache):
         await cache.close()
+    if monitor_client is not None:
+        await monitor_client.aclose()
     logger.info("Shutdown complete.")
 
-
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
 
 app = FastAPI(
     title="GNN Recipe Recommendation API",
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def timing_middleware(request: Request, call_next):
+    # perf_counter_ns avoids wall-clock jumps (NTP) skewing latency SLOs;
+    # exposing the timing as a response header lets the evaluation harness
+    # compare server-side latency against its own client-observed numbers.
+    start = time.perf_counter_ns()
+    response = await call_next(request)
+    latency_ms = (time.perf_counter_ns() - start) / 1e6
+    response.headers["x-process-time-ms"] = f"{latency_ms:.2f}"
+    return response
+
+
+async def _send_to_monitor(path: str, payload: dict) -> None:
+    """Fire-and-forget POST to the monitoring service.
+
+    Never raises — logs failures instead so a down monitor can't degrade serving.
+    """
+    if monitor_client is None:
+        return
+    try:
+        await monitor_client.post(f"{settings.MONITOR_URL}{path}", json=payload)
+    except Exception as exc:
+        logger.warning("monitor POST %s failed: %s", path, exc)
 
 
 @app.get("/health")
@@ -170,7 +187,7 @@ async def health():
 
 
 @app.post("/recommend", response_model=RecommendResponse)
-async def recommend(request: RecommendRequest):
+async def recommend(request: RecommendRequest, background_tasks: BackgroundTasks):
     """Return pre-computed recipe recommendations for *user_id*.
 
     Looks up a JSON blob from the cache keyed by user_id, resolves recipe
@@ -228,6 +245,21 @@ async def recommend(request: RecommendRequest):
         },
     )
 
+    # Background-dispatch so monitor latency does not enter the user's p99.
+    # latency_ms is owned by the middleware; sending 0 keeps the schema stable.
+    background_tasks.add_task(
+        _send_to_monitor,
+        "/track",
+        {
+            "user_id": user_id,
+            "recipe_ids": served_recipe_ids,
+            "predicted_scores": [r.predicted_score for r in enriched],
+            "latency_ms": 0,
+            "status_code": 200,
+            "timestamp": served_at,
+        },
+    )
+
     return RecommendResponse(
         user_id=user_id,
         recommendations=enriched,
@@ -235,9 +267,30 @@ async def recommend(request: RecommendRequest):
     )
 
 
-# ---------------------------------------------------------------------------
-# Entrypoint (for running directly with `python main.py`)
-# ---------------------------------------------------------------------------
+class FeedbackRequest(BaseModel):
+    user_id: str
+    recipe_id: str
+    rating: float
+
+
+@app.post("/feedback")
+async def feedback(request: FeedbackRequest, background_tasks: BackgroundTasks):
+    ts = datetime.now(timezone.utc).isoformat()
+    entry = {
+        "user_id": request.user_id,
+        "recipe_id": request.recipe_id,
+        "rating": request.rating,
+        "timestamp": ts,
+    }
+    # JSONL append is durable across crashes; the offline retraining job
+    # tails this file, so we must persist before acknowledging the client.
+    fpath = Path(settings.FEEDBACK_LOG_PATH)
+    fpath.parent.mkdir(parents=True, exist_ok=True)
+    with open(fpath, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    background_tasks.add_task(_send_to_monitor, "/feedback", entry)
+    return {"ok": True, "received_at": ts}
+
 
 if __name__ == "__main__":
     import uvicorn
