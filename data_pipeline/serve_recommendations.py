@@ -228,11 +228,9 @@ def inject_tags_via_database(recipe_uuids):
             if not result:
                 # Dynamic Backfill of missing Master Element
                 import uuid
-                from datetime import datetime
                 new_tag_id = str(uuid.uuid4())
-                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                insert_tag = text("INSERT INTO tags (id, name, color, date_added, update_date) VALUES (:id, :name, '#FF2E5B', :added, :updated)")
-                conn.execute(insert_tag, {"id": new_tag_id, "name": tag_name, "added": now, "updated": now})
+                insert_tag = text("INSERT INTO tags (id, name, slug) VALUES (:id, :name, :slug)")
+                conn.execute(insert_tag, {"id": new_tag_id, "name": tag_name, "slug": "ai-recommended"})
                 tag_id = new_tag_id
                 print(f"✨ Forged missing Master Tag: [{tag_name}] -> {tag_id}")
             else:
