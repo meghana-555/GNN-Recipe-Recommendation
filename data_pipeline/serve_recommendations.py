@@ -138,28 +138,38 @@ def execute_gnn_inference(s3, registry_df, num_recipes=7):
     # 2. Build Tensors
     recipe_feat, user_feat, recipe_feat_dim = build_features(recipes_df, users_df)
     
-    num_users = users_df['u'].max() + 1
-    num_recipes = recipes_df['i'].max() + 1
+    # 3. Pull & Peek S3 Model Weights FIRST to dynamically adjust tensor dimensions
+    print("Downloading neural weights (best_model.pt) from S3...")
+    device = torch.device('cpu')
+    model_path = "/tmp/best_model.pt"
+    s3.download_file(BUCKET_NAME, "training/best_model.pt", model_path)
+    state_dict = torch.load(model_path, map_location=device)
     
+    # Introspect trained dimensions dynamically
+    num_users_checkpoint = state_dict['user_emb.weight'].shape[0]
+    num_recipes_checkpoint = state_dict['recipe_emb.weight'].shape[0]
+    print(f"Aligning Graph Tensors to strict Model Checkpoint boundaries (U: {num_users_checkpoint}, R: {num_recipes_checkpoint})...")
+    
+    # Zero-Pad local feature arrays to avoid PyTorch Parameter Mismatch exception
+    if recipe_feat.shape[0] < num_recipes_checkpoint:
+        pad_size = num_recipes_checkpoint - recipe_feat.shape[0]
+        recipe_feat = torch.cat([recipe_feat, torch.zeros(pad_size, recipe_feat.shape[1])], dim=0)
+    
+    if user_feat.shape[0] < num_users_checkpoint:
+        pad_size = num_users_checkpoint - user_feat.shape[0]
+        user_feat = torch.cat([user_feat, torch.zeros(pad_size, user_feat.shape[1])], dim=0)
+
     # Construct base evaluation graph (Disconnected for pure isolated Cartesian Scoring)
-    # We pass empty edges for inference without propagating historical neighbor loops since it's zero-shot cold start testing.
     data = HeteroData()
-    data["user"].node_id = torch.arange(num_users)
-    data["recipe"].node_id = torch.arange(num_recipes)
+    data["user"].node_id = torch.arange(num_users_checkpoint)
+    data["recipe"].node_id = torch.arange(num_recipes_checkpoint)
     data["recipe"].x = recipe_feat
     data["user"].x = user_feat
     data["user", "rates", "recipe"].edge_index = torch.empty((2, 0), dtype=torch.long)
     data = T.ToUndirected()(data)
 
-    device = torch.device('cpu')
     model = Model(hidden_channels=64, recipe_feat_dim=recipe_feat_dim, data=data).to(device)
-    
-    # 3. Pull & Load Best S3 Model Weights
-    print("Downloading neural weights (best_model.pt) from S3...")
-    model_path = "/tmp/best_model.pt"
-    s3.download_file(BUCKET_NAME, "training/best_model.pt", model_path)
-    
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.load_state_dict(state_dict)
     model.eval()
     
     # 4. Neural Scoring Matrix (Dot Product logic)
