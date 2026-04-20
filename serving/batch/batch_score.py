@@ -16,7 +16,6 @@ container or a Kubernetes Job).  It:
        - A ``recipe_metadata.json`` file mapping recipe_id -> {name, tags}
          for the downstream serving API.
 """
-# Assisted by Claude
 
 from __future__ import annotations
 

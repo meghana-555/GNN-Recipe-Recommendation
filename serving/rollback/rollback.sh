@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Assisted by Claude
 # One-shot rollback: swap /models/recipe_gnn_model.pt.backup -> /models/recipe_gnn_model.pt
 # Exit codes:
 #   0  rollback applied

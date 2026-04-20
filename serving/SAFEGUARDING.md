@@ -1,4 +1,3 @@
-<!-- Assisted by Claude -->
 # Safeguarding
 
 This doc covers the responsible-deployment posture of the GNN recipe serving stack. Each subsection names a concrete concern, what we do about it today, and what is deferred.

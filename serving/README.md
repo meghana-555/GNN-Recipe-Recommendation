@@ -1,4 +1,3 @@
-<!-- Assisted by Claude -->
 # Serving Layer
 
 This is the online serving stack for the GNN recipe recommender: a heterogeneous GraphSAGE model trained on Mealie ratings, served behind a sub-50ms FastAPI. The key insight is that the expensive GPU work happens once a week in a batch job - the job scores every user against every recipe and writes the top-10 per user into Redis, so the online API reduces to a single cache lookup and a JSON serialization. A separate monitor service observes request telemetry and user ratings, joins them to compute Precision@10 and engagement signals, and decides whether each weekly retrained model should be promoted or rolled back. No inference happens on the hot path.

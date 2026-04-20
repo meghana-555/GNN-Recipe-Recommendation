@@ -14,7 +14,6 @@ Configuration via environment variables
 USER_POOL_SIZE : int
     Number of synthetic user ids (``user_0`` .. ``user_{N-1}``).  Default 1000.
 """
-# Assisted by Claude
 
 from __future__ import annotations
 

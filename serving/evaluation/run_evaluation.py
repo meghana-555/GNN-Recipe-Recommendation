@@ -35,7 +35,6 @@ Usage::
     OPTIMIZED_URL=http://optimized:8000 \
     python run_evaluation.py
 """
-# Assisted by Claude
 
 from __future__ import annotations
 

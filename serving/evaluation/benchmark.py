@@ -24,7 +24,6 @@ CODE_VERSION         : label for the code column  (default "HEAD")
 HARDWARE             : hardware description       (default "cpu")
 COMPUTE_INSTANCE     : cloud instance type         (default "chameleon-m1.medium")
 """
-# Assisted by Claude
 
 from __future__ import annotations
 

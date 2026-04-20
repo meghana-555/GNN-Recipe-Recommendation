@@ -5,7 +5,6 @@ Contains the heterogeneous GraphSAGE model, dot-product classifier,
 and the combined Model class -- extracted verbatim from the training
 notebook with RECIPE_FEAT_DIM made a constructor parameter.
 """
-# Assisted by Claude
 
 import typing
 

@@ -3,7 +3,6 @@
 All settings are loaded from environment variables with sensible defaults
 so the service runs out-of-the-box locally and in Docker on Chameleon cloud.
 """
-# Assisted by Claude
 
 from pydantic_settings import BaseSettings
 

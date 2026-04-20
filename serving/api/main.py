@@ -5,7 +5,6 @@ in-memory dict).  Recipe metadata (name, tags) is resolved from a JSON file
 produced by the batch pipeline.  No live model inference happens at request
 time, keeping p99 latency well under 50 ms.
 """
-# Assisted by Claude
 
 from __future__ import annotations
 

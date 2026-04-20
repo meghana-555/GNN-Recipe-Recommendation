@@ -1,4 +1,3 @@
-# Assisted by Claude
 FROM python:3.11-slim
 
 # curl is needed by the HEALTHCHECK instruction below; the slim image

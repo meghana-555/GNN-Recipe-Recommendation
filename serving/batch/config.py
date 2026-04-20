@@ -3,7 +3,6 @@ Configuration for the batch pre-computation pipeline.
 
 All settings are read from environment variables with sensible defaults.
 """
-# Assisted by Claude
 
 import os
 

@@ -5,7 +5,6 @@ operational even if the primary datastore is down, and the volumes are
 small enough (feedback events + served events) that linear scans over a
 7-30 day window are acceptable and trivially re-computable.
 """
-# Assisted by Claude
 
 from __future__ import annotations
 

@@ -4,7 +4,6 @@ Receives telemetry from the serving API (via /track) and user rating
 events (via /feedback), exposes aggregate metrics and promotion/rollback
 decisions.  Runs as a standalone FastAPI service on port 9090.
 """
-# Assisted by Claude
 
 from __future__ import annotations
 

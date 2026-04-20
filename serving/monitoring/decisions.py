@@ -4,7 +4,6 @@ Pure function over a metrics snapshot and a FeedbackStore; the caller
 owns persistence so this module can be unit-tested without filesystem
 side effects.
 """
-# Assisted by Claude
 
 from __future__ import annotations
 

@@ -3,7 +3,6 @@
 Keeps bounded deques so the monitoring service stays flat-memory under
 sustained traffic; percentiles and means are computed on snapshot read.
 """
-# Assisted by Claude
 
 from __future__ import annotations
 

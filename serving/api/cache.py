@@ -7,7 +7,6 @@ Supports two backends:
 Values are stored and returned as raw JSON strings so the caller is
 responsible for serialisation.
 """
-# Assisted by Claude
 
 from __future__ import annotations
 
