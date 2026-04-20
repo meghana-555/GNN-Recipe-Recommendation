@@ -48,6 +48,7 @@ services:
     command: ["bash", "orchestrator.sh"]
     volumes:
       - ./local_data:/app/local_data
+      - ./serve_recommendations.py:/app/serve_recommendations.py
 
 volumes:
   mealie-db-data:
