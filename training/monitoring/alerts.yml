@@ -1,0 +1,228 @@
+# Prometheus alerting rules for Mealie ML System
+
+groups:
+  # ─── MODEL SERVING ALERTS ─────────────────────────────────────────────────────
+  - name: model-serving
+    interval: 30s
+    rules:
+      - alert: RecommenderHighErrorRate
+        expr: |
+          sum(rate(http_requests_total{job=~"mealie-recommender.*", status=~"5.."}[5m])) by (job)
+          /
+          sum(rate(http_requests_total{job=~"mealie-recommender.*"}[5m])) by (job)
+          > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          component: inference
+        annotations:
+          summary: "High error rate in recommendation service"
+          description: "Error rate is {{ $value | humanizePercentage }} for {{ $labels.job }}"
+          runbook_url: "https://wiki.internal/runbooks/high-error-rate"
+
+      - alert: RecommenderHighLatency
+        expr: |
+          histogram_quantile(0.99, 
+            sum(rate(http_request_duration_seconds_bucket{job=~"mealie-recommender.*"}[5m])) by (job, le)
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+          component: inference
+        annotations:
+          summary: "High latency in recommendation service"
+          description: "P99 latency is {{ $value | humanizeDuration }} for {{ $labels.job }}"
+
+      - alert: RecommenderDown
+        expr: up{job=~"mealie-recommender.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: inference
+        annotations:
+          summary: "Recommendation service is down"
+          description: "{{ $labels.job }} has been down for more than 2 minutes"
+
+      - alert: CanaryHighErrorRate
+        expr: |
+          sum(rate(http_requests_total{job="mealie-recommender-production", version="canary", status=~"5.."}[10m]))
+          /
+          sum(rate(http_requests_total{job="mealie-recommender-production", version="canary"}[10m]))
+          > 0.03
+        for: 5m
+        labels:
+          severity: warning
+          component: canary
+        annotations:
+          summary: "Canary deployment showing elevated error rate"
+          description: "Canary error rate is {{ $value | humanizePercentage }}, consider aborting rollout"
+
+  # ─── MODEL QUALITY ALERTS ─────────────────────────────────────────────────────
+  - name: model-quality
+    interval: 1m
+    rules:
+      - alert: LowRecommendationClickThrough
+        expr: |
+          sum(rate(recommendations_clicked_total[1h]))
+          /
+          sum(rate(recommendations_served_total[1h]))
+          < 0.05
+        for: 30m
+        labels:
+          severity: warning
+          component: model-quality
+        annotations:
+          summary: "Low recommendation click-through rate"
+          description: "CTR is {{ $value | humanizePercentage }}, below 5% threshold"
+
+      - alert: RecommendationDiversityLow
+        expr: |
+          avg(recommendation_diversity_score) < 0.3
+        for: 1h
+        labels:
+          severity: info
+          component: fairness
+        annotations:
+          summary: "Low recommendation diversity"
+          description: "Recommendations may be too concentrated on popular items"
+
+      - alert: DataDriftDetected
+        expr: |
+          feature_drift_score > 0.3
+        for: 30m
+        labels:
+          severity: warning
+          component: data-quality
+        annotations:
+          summary: "Feature distribution drift detected"
+          description: "Drift score {{ $value }} exceeds threshold, model retraining may be needed"
+
+  # ─── TRAINING PIPELINE ALERTS ─────────────────────────────────────────────────
+  - name: training-pipeline
+    interval: 1m
+    rules:
+      - alert: TrainingJobFailed
+        expr: |
+          kube_job_status_failed{job_name=~"model-retraining.*"} > 0
+        for: 1m
+        labels:
+          severity: warning
+          component: training
+        annotations:
+          summary: "Model training job failed"
+          description: "Training job {{ $labels.job_name }} has failed"
+
+      - alert: TrainingJobStuck
+        expr: |
+          time() - kube_job_status_start_time{job_name=~"model-retraining.*"} > 7200
+          and
+          kube_job_status_active{job_name=~"model-retraining.*"} > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: training
+        annotations:
+          summary: "Training job running too long"
+          description: "Training job {{ $labels.job_name }} has been running for over 2 hours"
+
+      - alert: NoRecentTraining
+        expr: |
+          time() - max(mlflow_model_version_creation_timestamp) > 604800
+        for: 1h
+        labels:
+          severity: info
+          component: training
+        annotations:
+          summary: "No model training in past week"
+          description: "Consider checking if retraining pipeline is functioning"
+
+      - alert: ModelQualityBelowThreshold
+        expr: |
+          mlflow_model_metric_test_auc < 0.70
+        for: 1m
+        labels:
+          severity: warning
+          component: model-quality
+        annotations:
+          summary: "Model quality below threshold"
+          description: "Latest model AUC {{ $value }} is below 0.70 threshold"
+
+  # ─── INFRASTRUCTURE ALERTS ────────────────────────────────────────────────────
+  - name: infrastructure
+    interval: 30s
+    rules:
+      - alert: MLflowDown
+        expr: up{job="mlflow"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          component: mlflow
+        annotations:
+          summary: "MLflow tracking server is down"
+          description: "MLflow has been unreachable for 5 minutes"
+
+      - alert: ObjectStorageUnreachable
+        expr: |
+          probe_success{job="blackbox", target=~".*chameleoncloud.*"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          component: storage
+        annotations:
+          summary: "Object storage unreachable"
+          description: "Cannot connect to Chameleon object storage"
+
+      - alert: HighMemoryUsage
+        expr: |
+          container_memory_usage_bytes{container=~"recommender.*"}
+          /
+          container_spec_memory_limit_bytes{container=~"recommender.*"}
+          > 0.9
+        for: 10m
+        labels:
+          severity: warning
+          component: resources
+        annotations:
+          summary: "High memory usage in recommendation service"
+          description: "Memory usage is {{ $value | humanizePercentage }} of limit"
+
+      - alert: HighCPUUsage
+        expr: |
+          rate(container_cpu_usage_seconds_total{container=~"recommender.*"}[5m])
+          /
+          container_spec_cpu_quota{container=~"recommender.*"}
+          * container_spec_cpu_period{container=~"recommender.*"}
+          > 0.9
+        for: 10m
+        labels:
+          severity: warning
+          component: resources
+        annotations:
+          summary: "High CPU usage in recommendation service"
+          description: "CPU usage is {{ $value | humanizePercentage }} of limit"
+
+  # ─── ROLLBACK ALERTS ──────────────────────────────────────────────────────────
+  - name: rollback
+    interval: 30s
+    rules:
+      - alert: AutoRollbackTriggered
+        expr: |
+          increase(rollback_events_total{type="automatic"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: deployment
+        annotations:
+          summary: "Automatic rollback was triggered"
+          description: "System automatically rolled back due to health check failure"
+
+      - alert: MultipleRollbacksRecent
+        expr: |
+          increase(rollback_events_total[24h]) > 2
+        for: 5m
+        labels:
+          severity: warning
+          component: deployment
+        annotations:
+          summary: "Multiple rollbacks in past 24 hours"
+          description: "{{ $value }} rollbacks occurred, investigate stability issues"

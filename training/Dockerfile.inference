@@ -1,0 +1,30 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install PyTorch (CPU)
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+# Install PyG and pyg-lib
+RUN pip install --no-cache-dir torch-geometric \
+    && pip install --no-cache-dir pyg-lib -f https://data.pyg.org/whl/torch-$(python -c "import torch; print(torch.__version__.split('+')[0])")+cpu.html
+
+# Install inference dependencies
+RUN pip install --no-cache-dir \
+    fastapi \
+    uvicorn \
+    pandas \
+    numpy \
+    scikit-learn \
+    prometheus-client
+
+# Copy inference service
+COPY inference_service.py .
+
+# Copy model and data
+COPY best_model.pt ./best_model.pt
+COPY data/ ./data/
+
+EXPOSE 8000
+
+CMD ["python", "inference_service.py"]

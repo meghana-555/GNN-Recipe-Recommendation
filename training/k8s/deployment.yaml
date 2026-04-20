@@ -1,0 +1,467 @@
+# Kubernetes manifests for Mealie ML Recommendation System
+# Three environments: staging, canary, production
+# Uses Istio for traffic management and canary deployments
+
+---
+# ─── NAMESPACE ────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mealie-staging
+  labels:
+    istio-injection: enabled
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mealie-production
+  labels:
+    istio-injection: enabled
+
+---
+# ─── CONFIG MAPS ──────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ml-config
+  namespace: mealie-staging
+data:
+  MLFLOW_TRACKING_URI: "http://mlflow.mealie-infra.svc.cluster.local:5000"
+  MODEL_REGISTRY_NAME: "mealie-recipe-recommender"
+  MIN_TEST_AUC: "0.70"
+  MIN_TEST_AP: "0.65"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ml-config
+  namespace: mealie-production
+data:
+  MLFLOW_TRACKING_URI: "http://mlflow.mealie-infra.svc.cluster.local:5000"
+  MODEL_REGISTRY_NAME: "mealie-recipe-recommender"
+  MIN_TEST_AUC: "0.70"
+  MIN_TEST_AP: "0.65"
+
+---
+# ─── SECRETS (use sealed-secrets or external-secrets in production) ───────────
+apiVersion: v1
+kind: Secret
+metadata:
+  name: chameleon-credentials
+  namespace: mealie-staging
+type: Opaque
+stringData:
+  CHAMELEON_ACCESS_KEY: "${CHAMELEON_ACCESS_KEY}"
+  CHAMELEON_SECRET_KEY: "${CHAMELEON_SECRET_KEY}"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: chameleon-credentials
+  namespace: mealie-production
+type: Opaque
+stringData:
+  CHAMELEON_ACCESS_KEY: "${CHAMELEON_ACCESS_KEY}"
+  CHAMELEON_SECRET_KEY: "${CHAMELEON_SECRET_KEY}"
+
+---
+# ─── STAGING DEPLOYMENT ───────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mealie-recommender-staging
+  namespace: mealie-staging
+  labels:
+    app: mealie-recommender
+    environment: staging
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mealie-recommender
+      environment: staging
+  template:
+    metadata:
+      labels:
+        app: mealie-recommender
+        environment: staging
+        version: staging
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: recommender
+          image: ghcr.io/your-org/mealie-inference:latest
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: ml-config
+            - secretRef:
+                name: chameleon-credentials
+          env:
+            - name: DEPLOY_ENV
+              value: "staging"
+            - name: MODEL_STAGE
+              value: "Staging"
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mealie-recommender
+  namespace: mealie-staging
+spec:
+  selector:
+    app: mealie-recommender
+  ports:
+    - port: 80
+      targetPort: 8000
+      name: http
+
+---
+# ─── PRODUCTION DEPLOYMENT (stable) ───────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mealie-recommender-production
+  namespace: mealie-production
+  labels:
+    app: mealie-recommender
+    environment: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mealie-recommender
+      version: stable
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: mealie-recommender
+        environment: production
+        version: stable
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      containers:
+        - name: recommender
+          image: ghcr.io/your-org/mealie-inference:production
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: ml-config
+            - secretRef:
+                name: chameleon-credentials
+          env:
+            - name: DEPLOY_ENV
+              value: "production"
+            - name: MODEL_STAGE
+              value: "Production"
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+---
+# ─── CANARY DEPLOYMENT ────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mealie-recommender-canary
+  namespace: mealie-production
+  labels:
+    app: mealie-recommender
+    environment: production
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mealie-recommender
+      version: canary
+  template:
+    metadata:
+      labels:
+        app: mealie-recommender
+        environment: production
+        version: canary
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      containers:
+        - name: recommender
+          image: ghcr.io/your-org/mealie-inference:canary
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: ml-config
+            - secretRef:
+                name: chameleon-credentials
+          env:
+            - name: DEPLOY_ENV
+              value: "canary"
+            - name: MODEL_STAGE
+              value: "Staging"
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+
+---
+# ─── PRODUCTION SERVICE ───────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: mealie-recommender
+  namespace: mealie-production
+spec:
+  selector:
+    app: mealie-recommender
+  ports:
+    - port: 80
+      targetPort: 8000
+      name: http
+
+---
+# ─── ISTIO VIRTUAL SERVICE (Traffic Splitting) ────────────────────────────────
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: mealie-recommender
+  namespace: mealie-production
+spec:
+  hosts:
+    - mealie-recommender
+    - recommendations.mealie.example.com
+  http:
+    - match:
+        - headers:
+            x-canary:
+              exact: "true"
+      route:
+        - destination:
+            host: mealie-recommender
+            subset: canary
+    - route:
+        - destination:
+            host: mealie-recommender
+            subset: stable
+          weight: 100
+        - destination:
+            host: mealie-recommender
+            subset: canary
+          weight: 0
+
+---
+# ─── ISTIO DESTINATION RULE ───────────────────────────────────────────────────
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: mealie-recommender
+  namespace: mealie-production
+spec:
+  host: mealie-recommender
+  trafficPolicy:
+    connectionPool:
+      http:
+        http1MaxPendingRequests: 100
+        http2MaxRequests: 1000
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 30s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+  subsets:
+    - name: stable
+      labels:
+        version: stable
+    - name: canary
+      labels:
+        version: canary
+
+---
+# ─── HORIZONTAL POD AUTOSCALER ────────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mealie-recommender-hpa
+  namespace: mealie-production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mealie-recommender-production
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+# ─── TRAINING CRONJOB ─────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: model-retraining
+  namespace: mealie-staging
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: training
+              image: ghcr.io/your-org/mealie-training:latest
+              envFrom:
+                - configMapRef:
+                    name: ml-config
+                - secretRef:
+                    name: chameleon-credentials
+              resources:
+                requests:
+                  memory: "4Gi"
+                  cpu: "2000m"
+                limits:
+                  memory: "8Gi"
+                  cpu: "4000m"
+
+---
+# ─── FEEDBACK CAPTURE DEPLOYMENT ──────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feedback-capture
+  namespace: mealie-production
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: feedback-capture
+  template:
+    metadata:
+      labels:
+        app: feedback-capture
+    spec:
+      containers:
+        - name: feedback-capture
+          image: ghcr.io/your-org/mealie-feedback:latest
+          args: ["--continuous", "--interval", "3600"]
+          envFrom:
+            - configMapRef:
+                name: ml-config
+            - secretRef:
+                name: chameleon-credentials
+          env:
+            - name: MEALIE_URL
+              value: "http://mealie.mealie-app.svc.cluster.local:9000"
+            - name: MEALIE_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mealie-credentials
+                  key: admin-token
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+
+---
+# ─── POD DISRUPTION BUDGET ────────────────────────────────────────────────────
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mealie-recommender-pdb
+  namespace: mealie-production
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: mealie-recommender
+      version: stable
+
+---
+# ─── SERVICE MONITOR (Prometheus) ─────────────────────────────────────────────
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mealie-recommender
+  namespace: mealie-production
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: mealie-recommender
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+  namespaceSelector:
+    matchNames:
+      - mealie-production

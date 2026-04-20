@@ -1,0 +1,10 @@
+FROM python:3.9-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    requests
+
+COPY simulate_production_traffic.py .
+
+CMD ["python", "simulate_production_traffic.py", "--duration", "86400", "--rate", "5"]

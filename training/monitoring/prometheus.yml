@@ -1,0 +1,112 @@
+# Prometheus configuration for Mealie ML System monitoring
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'mealie-ml'
+    env: 'production'
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+# Load rules once and periodically evaluate them
+rule_files:
+  - "alerts.yml"
+
+# Scrape configs
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # MLflow tracking server
+  - job_name: 'mlflow'
+    static_configs:
+      - targets: ['mlflow:5000']
+    metrics_path: /metrics
+
+  # Inference service
+  - job_name: 'mealie-inference'
+    static_configs:
+      - targets: ['inference:8000']
+    metrics_path: /metrics
+
+  # Mealie recommendation service - staging
+  - job_name: 'mealie-recommender-staging'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - mealie-staging
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: mealie-recommender
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - action: labelmap
+        regex: __meta_kubernetes_pod_label_(.+)
+
+  # Mealie recommendation service - production
+  - job_name: 'mealie-recommender-production'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - mealie-production
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: mealie-recommender
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - action: labelmap
+        regex: __meta_kubernetes_pod_label_(.+)
+      - source_labels: [__meta_kubernetes_pod_label_version]
+        target_label: deployment_version
+
+  # Training jobs
+  - job_name: 'training-jobs'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - mealie-staging
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_job_name]
+        action: keep
+        regex: model-retraining.*
+
+  # Node metrics (via node-exporter)
+  - job_name: 'node'
+    kubernetes_sd_configs:
+      - role: node
+    relabel_configs:
+      - action: labelmap
+        regex: __meta_kubernetes_node_label_(.+)

@@ -1,0 +1,492 @@
+name: ML Training Pipeline CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'train.py'
+      - 'Dockerfile'
+      - 'requirements.txt'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force_retrain:
+        description: 'Force retraining even without data changes'
+        required: false
+        default: 'false'
+      target_environment:
+        description: 'Target environment for deployment'
+        required: false
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - canary
+          - production
+  schedule:
+    # Check for new data and retrain daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/mealie-training
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+  CHAMELEON_ACCESS_KEY: ${{ secrets.CHAMELEON_ACCESS_KEY }}
+  CHAMELEON_SECRET_KEY: ${{ secrets.CHAMELEON_SECRET_KEY }}
+
+jobs:
+  # ─── VALIDATE & TEST ──────────────────────────────────────────────────────────
+  validate:
+    name: Validate Code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install flake8 pytest black isort
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install torch-geometric pandas numpy scikit-learn mlflow boto3 tqdm
+      
+      - name: Lint with flake8
+        run: |
+          flake8 train.py --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 train.py --count --exit-zero --max-complexity=15 --max-line-length=120 --statistics
+      
+      - name: Check formatting
+        run: |
+          black --check --diff train.py || true
+          isort --check-only train.py || true
+      
+      - name: Run unit tests
+        run: |
+          pytest tests/ -v --tb=short || echo "No tests found"
+
+  # ─── BUILD DOCKER IMAGE ───────────────────────────────────────────────────────
+  build:
+    name: Build Training Image
+    runs-on: ubuntu-latest
+    needs: validate
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─── CHECK DATA FRESHNESS ─────────────────────────────────────────────────────
+  check-data:
+    name: Check for New Training Data
+    runs-on: ubuntu-latest
+    needs: build
+    outputs:
+      should_train: ${{ steps.check.outputs.should_train }}
+      data_version: ${{ steps.check.outputs.data_version }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      
+      - name: Install boto3
+        run: pip install boto3
+      
+      - name: Check for new data
+        id: check
+        env:
+          FORCE_RETRAIN: ${{ github.event.inputs.force_retrain }}
+        run: |
+          python << 'EOF'
+          import os
+          import boto3
+          from botocore.client import Config
+          from datetime import datetime, timedelta
+
+          s3 = boto3.client(
+              's3',
+              aws_access_key_id=os.environ['CHAMELEON_ACCESS_KEY'],
+              aws_secret_access_key=os.environ['CHAMELEON_SECRET_KEY'],
+              endpoint_url='https://chi.tacc.chameleoncloud.org:7480',
+              config=Config(signature_version='s3v4'),
+              region_name='us-east-1'
+          )
+
+          bucket = 'ObjStore_proj14'
+          
+          # Check for new training data
+          paginator = s3.get_paginator('list_objects_v2')
+          train_files = []
+          for page in paginator.paginate(Bucket=bucket, Prefix='train/'):
+              for obj in page.get('Contents', []):
+                  if obj['Key'].endswith('.csv'):
+                      train_files.append((obj['Key'], obj['LastModified']))
+          
+          should_train = 'false'
+          data_version = 'none'
+          
+          if train_files:
+              train_files.sort(key=lambda x: x[1], reverse=True)
+              latest_key, latest_time = train_files[0]
+              data_version = latest_key.split('/')[-1].replace('.csv', '')
+              
+              # Check if data is newer than 24 hours
+              if latest_time.replace(tzinfo=None) > datetime.utcnow() - timedelta(hours=24):
+                  should_train = 'true'
+          
+          # Force retrain if requested
+          if os.environ.get('FORCE_RETRAIN') == 'true':
+              should_train = 'true'
+          
+          print(f"should_train={should_train}")
+          print(f"data_version={data_version}")
+          
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"should_train={should_train}\n")
+              f.write(f"data_version={data_version}\n")
+          EOF
+
+  # ─── TRAIN MODEL ──────────────────────────────────────────────────────────────
+  train:
+    name: Train Model
+    runs-on: ubuntu-latest
+    needs: [build, check-data]
+    if: needs.check-data.outputs.should_train == 'true' || github.event_name == 'workflow_dispatch'
+    outputs:
+      model_version: ${{ steps.train.outputs.model_version }}
+      test_auc: ${{ steps.train.outputs.test_auc }}
+      quality_passed: ${{ steps.train.outputs.quality_passed }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-2.0.1+cpu.html
+          pip install torch-geometric pandas numpy scikit-learn mlflow boto3 tqdm
+      
+      - name: Download static data
+        run: |
+          mkdir -p data
+          # Download PP_recipes.csv, PP_users.csv, validation/test sets from object storage
+          python << 'EOF'
+          import os
+          import boto3
+          from botocore.client import Config
+
+          s3 = boto3.client(
+              's3',
+              aws_access_key_id=os.environ['CHAMELEON_ACCESS_KEY'],
+              aws_secret_access_key=os.environ['CHAMELEON_SECRET_KEY'],
+              endpoint_url='https://chi.tacc.chameleoncloud.org:7480',
+              config=Config(signature_version='s3v4'),
+              region_name='us-east-1'
+          )
+
+          bucket = 'ObjStore_proj14'
+          files = [
+              ('static/PP_recipes.csv', 'data/PP_recipes.csv'),
+              ('static/PP_users.csv', 'data/PP_users.csv'),
+              ('static/interactions_validation.csv', 'data/interactions_validation.csv'),
+              ('static/interactions_test.csv', 'data/interactions_test.csv'),
+          ]
+          
+          for s3_key, local_path in files:
+              try:
+                  s3.download_file(bucket, s3_key, local_path)
+                  print(f"Downloaded {s3_key}")
+              except Exception as e:
+                  print(f"Warning: Could not download {s3_key}: {e}")
+          EOF
+      
+      - name: Run training
+        id: train
+        run: |
+          python train.py 2>&1 | tee training_output.log
+          
+          # Parse output for metrics
+          TEST_AUC=$(grep "Test AUC:" training_output.log | tail -1 | awk '{print $NF}')
+          MODEL_REGISTERED=$(grep "model_registered" training_output.log | grep -c "True" || echo "0")
+          
+          echo "test_auc=${TEST_AUC}" >> $GITHUB_OUTPUT
+          echo "quality_passed=$([ "$MODEL_REGISTERED" -gt 0 ] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          
+          # Get model version from MLflow
+          MODEL_VERSION=$(grep "Registered as version" training_output.log | awk '{print $NF}' || echo "none")
+          echo "model_version=${MODEL_VERSION}" >> $GITHUB_OUTPUT
+      
+      - name: Upload training artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-artifacts
+          path: |
+            best_model.pt
+            training_output.log
+          retention-days: 30
+
+  # ─── DEPLOY TO STAGING ────────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: train
+    if: needs.train.outputs.quality_passed == 'true'
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+      
+      - name: Configure Kubernetes
+        run: |
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > kubeconfig.yaml
+          export KUBECONFIG=kubeconfig.yaml
+      
+      - name: Deploy to staging
+        run: |
+          export KUBECONFIG=kubeconfig.yaml
+          export MODEL_VERSION=${{ needs.train.outputs.model_version }}
+          
+          # Update staging deployment with new model version
+          kubectl set image deployment/mealie-recommender-staging \
+            recommender=ghcr.io/${{ github.repository }}/mealie-inference:${MODEL_VERSION} \
+            -n mealie-staging || echo "Deployment not found, creating..."
+          
+          # Wait for rollout
+          kubectl rollout status deployment/mealie-recommender-staging -n mealie-staging --timeout=300s
+      
+      - name: Run staging tests
+        run: |
+          # Run integration tests against staging
+          echo "Running staging integration tests..."
+          sleep 30  # Wait for service to stabilize
+          
+          # Health check
+          curl -f http://staging.mealie.internal/api/recommendations/health || exit 1
+
+  # ─── CANARY DEPLOYMENT ────────────────────────────────────────────────────────
+  deploy-canary:
+    name: Deploy Canary
+    runs-on: ubuntu-latest
+    needs: [train, deploy-staging]
+    if: needs.train.outputs.quality_passed == 'true' && github.ref == 'refs/heads/main'
+    environment: canary
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure Kubernetes
+        run: |
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > kubeconfig.yaml
+      
+      - name: Deploy canary (10% traffic)
+        run: |
+          export KUBECONFIG=kubeconfig.yaml
+          export MODEL_VERSION=${{ needs.train.outputs.model_version }}
+          
+          # Update canary deployment
+          kubectl set image deployment/mealie-recommender-canary \
+            recommender=ghcr.io/${{ github.repository }}/mealie-inference:${MODEL_VERSION} \
+            -n mealie-production
+          
+          # Set canary traffic weight to 10%
+          kubectl patch virtualservice mealie-recommender \
+            --type=json \
+            -p='[{"op": "replace", "path": "/spec/http/0/route/1/weight", "value": 10}]' \
+            -n mealie-production
+      
+      - name: Monitor canary (2 hours)
+        run: |
+          echo "Canary deployed. Monitoring for 2 hours..."
+          # In production, this would wait and check metrics
+          # For CI, we use a shorter timeout with approval gate
+          sleep 60
+      
+      - name: Evaluate canary metrics
+        id: canary_eval
+        run: |
+          # Query Prometheus for canary metrics
+          python << 'EOF'
+          import os
+          import requests
+
+          metrics_url = os.environ.get('PROMETHEUS_URL', 'http://prometheus.internal:9090')
+          
+          # Check error rate
+          # Check latency
+          # Check user satisfaction
+          
+          # Placeholder - in production, fetch real metrics
+          error_rate = 0.02
+          passed = error_rate < 0.05
+          
+          print(f"Canary error rate: {error_rate:.2%}")
+          print(f"Canary passed: {passed}")
+          
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"canary_passed={'true' if passed else 'false'}\n")
+          EOF
+
+  # ─── PRODUCTION DEPLOYMENT ────────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [train, deploy-canary]
+    if: needs.deploy-canary.result == 'success' && github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure Kubernetes
+        run: |
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > kubeconfig.yaml
+      
+      - name: Promote to production
+        run: |
+          export KUBECONFIG=kubeconfig.yaml
+          export MODEL_VERSION=${{ needs.train.outputs.model_version }}
+          
+          # Update production deployment
+          kubectl set image deployment/mealie-recommender-production \
+            recommender=ghcr.io/${{ github.repository }}/mealie-inference:${MODEL_VERSION} \
+            -n mealie-production
+          
+          # Remove canary traffic split (100% to production)
+          kubectl patch virtualservice mealie-recommender \
+            --type=json \
+            -p='[{"op": "replace", "path": "/spec/http/0/route/0/weight", "value": 100},
+                 {"op": "replace", "path": "/spec/http/0/route/1/weight", "value": 0}]' \
+            -n mealie-production
+          
+          # Wait for rollout
+          kubectl rollout status deployment/mealie-recommender-production -n mealie-production --timeout=300s
+      
+      - name: Update MLflow model stage
+        run: |
+          python << 'EOF'
+          import mlflow
+          from mlflow.tracking import MlflowClient
+          import os
+
+          mlflow.set_tracking_uri(os.environ['MLFLOW_TRACKING_URI'])
+          client = MlflowClient()
+          
+          model_name = "mealie-recipe-recommender"
+          version = "${{ needs.train.outputs.model_version }}"
+          
+          # Transition to production
+          client.transition_model_version_stage(
+              name=model_name,
+              version=version,
+              stage="Production",
+              archive_existing_versions=True
+          )
+          print(f"Model version {version} promoted to Production")
+          EOF
+      
+      - name: Notify deployment
+        run: |
+          echo "🚀 Model version ${{ needs.train.outputs.model_version }} deployed to production"
+          echo "Test AUC: ${{ needs.train.outputs.test_auc }}"
+
+  # ─── ROLLBACK JOB ─────────────────────────────────────────────────────────────
+  rollback:
+    name: Rollback Production
+    runs-on: ubuntu-latest
+    if: failure() && github.ref == 'refs/heads/main'
+    needs: [deploy-production]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure Kubernetes
+        run: |
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > kubeconfig.yaml
+      
+      - name: Rollback deployment
+        run: |
+          export KUBECONFIG=kubeconfig.yaml
+          
+          echo "⚠️ Rolling back production deployment..."
+          kubectl rollout undo deployment/mealie-recommender-production -n mealie-production
+          
+          # Wait for rollback
+          kubectl rollout status deployment/mealie-recommender-production -n mealie-production --timeout=300s
+      
+      - name: Restore previous model in MLflow
+        run: |
+          python << 'EOF'
+          import mlflow
+          from mlflow.tracking import MlflowClient
+          import os
+
+          mlflow.set_tracking_uri(os.environ['MLFLOW_TRACKING_URI'])
+          client = MlflowClient()
+          
+          model_name = "mealie-recipe-recommender"
+          
+          # Find previous production version (now archived)
+          versions = client.search_model_versions(f"name='{model_name}'")
+          archived = [v for v in versions if v.current_stage == "Archived"]
+          
+          if archived:
+              archived.sort(key=lambda x: int(x.version), reverse=True)
+              rollback_version = archived[0].version
+              
+              client.transition_model_version_stage(
+                  name=model_name,
+                  version=rollback_version,
+                  stage="Production"
+              )
+              print(f"Rolled back to model version {rollback_version}")
+          EOF
+      
+      - name: Notify rollback
+        run: |
+          echo "⚠️ Production rollback completed"

@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Data (too large for git)
+data/
+*.csv
+
+# Model artifacts
+best_model.pt
+mlruns/
+mlflow.db
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/

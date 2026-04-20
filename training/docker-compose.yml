@@ -1,0 +1,185 @@
+# Docker Compose for Mealie ML Training Infrastructure
+# Supports: staging, canary, production environments
+# Includes: MLflow, Prometheus, Grafana for monitoring
+
+version: '3.8'
+
+services:
+  # ─── MLFLOW TRACKING SERVER ─────────────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.9.2
+    container_name: mlflow-server
+    ports:
+      - "5000:5000"
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:///mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+    volumes:
+      - mlflow-data:/mlflow
+    networks:
+      - mealie-ml
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/')\""]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ─── TRAINING SERVICE ───────────────────────────────────────────────────────
+  training:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mealie-training
+    environment:
+      - CHAMELEON_ACCESS_KEY=${CHAMELEON_ACCESS_KEY}
+      - CHAMELEON_SECRET_KEY=${CHAMELEON_SECRET_KEY}
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - DEPLOY_ENV=staging
+    volumes:
+      - ./data:/app/data
+      - training-output:/app/output
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    networks:
+      - mealie-ml
+    profiles:
+      - training
+
+  # ─── FEEDBACK CAPTURE SERVICE ───────────────────────────────────────────────
+  feedback-capture:
+    build:
+      context: .
+      dockerfile: Dockerfile.feedback
+    container_name: feedback-capture
+    environment:
+      - CHAMELEON_ACCESS_KEY=${CHAMELEON_ACCESS_KEY}
+      - CHAMELEON_SECRET_KEY=${CHAMELEON_SECRET_KEY}
+      - MEALIE_URL=${MEALIE_URL:-http://mealie:9000}
+      - MEALIE_ADMIN_TOKEN=${MEALIE_ADMIN_TOKEN}
+      - RETRAIN_WEBHOOK_URL=http://retrain-orchestrator:8080/trigger
+    command: ["python", "feedback_capture.py", "--continuous", "--interval", "3600"]
+    depends_on:
+      - mlflow
+    networks:
+      - mealie-ml
+    restart: unless-stopped
+
+  # ─── INFERENCE SERVICE ──────────────────────────────────────────────────────
+  inference:
+    build:
+      context: .
+      dockerfile: Dockerfile.inference
+    container_name: mealie-inference
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_PATH=/app/best_model.pt
+      - DATA_PATH=/app/data
+      - HOST=0.0.0.0
+      - PORT=8000
+    volumes:
+      - ./data:/app/data:ro
+      - ./best_model.pt:/app/best_model.pt:ro
+    networks:
+      - mealie-ml
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ─── RETRAIN ORCHESTRATOR ───────────────────────────────────────────────────
+  retrain-orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.orchestrator
+    container_name: retrain-orchestrator
+    ports:
+      - "8080:8080"
+    environment:
+      - CHAMELEON_ACCESS_KEY=${CHAMELEON_ACCESS_KEY}
+      - CHAMELEON_SECRET_KEY=${CHAMELEON_SECRET_KEY}
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - METRICS_ENDPOINT=http://prometheus:9090
+    command: ["python", "retrain_orchestrator.py", "--mode", "watch", "--interval", "60"]
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    networks:
+      - mealie-ml
+    restart: unless-stopped
+
+  # ─── PROMETHEUS MONITORING ──────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    networks:
+      - mealie-ml
+    restart: unless-stopped
+
+  # ─── GRAFANA DASHBOARDS ─────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - mealie-ml
+    restart: unless-stopped
+
+  # ─── TRAFFIC SIMULATOR (for testing) ────────────────────────────────────────
+  traffic-simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile.simulator
+    container_name: traffic-simulator
+    environment:
+      - MEALIE_URL=${MEALIE_URL:-http://mealie:9000}
+      - MEALIE_ADMIN_TOKEN=${MEALIE_ADMIN_TOKEN}
+    command: ["python", "simulate_production_traffic.py", "--duration", "86400", "--rate", "5"]
+    networks:
+      - mealie-ml
+    profiles:
+      - simulation
+    restart: unless-stopped
+
+networks:
+  mealie-ml:
+    driver: bridge
+    name: mealie-ml-network
+
+volumes:
+  mlflow-data:
+  training-output:
+  prometheus-data:
+  grafana-data:
