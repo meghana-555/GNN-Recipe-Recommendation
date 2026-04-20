@@ -228,9 +228,14 @@ def inject_tags_via_database(recipe_uuids):
             if not result:
                 # Dynamic Backfill of missing Master Element
                 import uuid
+                
+                # Extract tenant Group ID to satisfy Mealie strict relational rules
+                group_query = text("SELECT id FROM groups LIMIT 1")
+                group_id = conn.execute(group_query).fetchone()[0]
+                
                 new_tag_id = str(uuid.uuid4())
-                insert_tag = text("INSERT INTO tags (id, name, slug) VALUES (:id, :name, :slug)")
-                conn.execute(insert_tag, {"id": new_tag_id, "name": tag_name, "slug": "ai-recommended"})
+                insert_tag = text("INSERT INTO tags (id, name, slug, group_id) VALUES (:id, :name, :slug, :group_id)")
+                conn.execute(insert_tag, {"id": new_tag_id, "name": tag_name, "slug": "ai-recommended", "group_id": group_id})
                 tag_id = new_tag_id
                 print(f"✨ Forged missing Master Tag: [{tag_name}] -> {tag_id}")
             else:
