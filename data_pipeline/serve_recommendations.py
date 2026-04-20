@@ -157,7 +157,7 @@ def execute_gnn_inference(s3, registry_df, num_recipes=7):
     # 3. Pull & Load Best S3 Model Weights
     print("Downloading neural weights (best_model.pt) from S3...")
     model_path = "/tmp/best_model.pt"
-    s3.download_file(BUCKET_NAME, "dataset/training/best_model.pt", model_path)
+    s3.download_file(BUCKET_NAME, "training/best_model.pt", model_path)
     
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
