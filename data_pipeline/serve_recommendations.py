@@ -182,6 +182,17 @@ def execute_gnn_inference(s3, registry_df, num_recipes=7):
         # Calculate scores against ALL available recipes
         scores = (user_emb * recipe_embs).sum(dim=-1)            # Shape (Num_Recipes)
         
+        # Constrain to ONLY valid UUID recipes loaded in frontend Mealie DB
+        valid_recipe_ints = recipe_registry['ml_native_id'].tolist()
+        
+        mask = torch.ones_like(scores, dtype=torch.bool)
+        # Keep seeded recipes unmasked (valid)
+        if valid_recipe_ints:
+            mask[valid_recipe_ints] = False
+        
+        # Impose -inf to completely zero-out unseeded datasets
+        scores[mask] = -float('inf')
+        
         # 5. Extract Top K recommendations
         top_k_scores, top_k_indices = torch.topk(scores, k=num_recipes)
     
@@ -215,9 +226,17 @@ def inject_tags_via_database(recipe_uuids):
             tag_query = text("SELECT id FROM tags WHERE name = :name LIMIT 1")
             result = conn.execute(tag_query, {"name": tag_name}).fetchone()
             if not result:
-                print("❌ Master Tag not found in Database.")
-                return
-            tag_id = result[0]
+                # Dynamic Backfill of missing Master Element
+                import uuid
+                from datetime import datetime
+                new_tag_id = str(uuid.uuid4())
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                insert_tag = text("INSERT INTO tags (id, name, color, date_added, update_date) VALUES (:id, :name, '#FF2E5B', :added, :updated)")
+                conn.execute(insert_tag, {"id": new_tag_id, "name": tag_name, "added": now, "updated": now})
+                tag_id = new_tag_id
+                print(f"✨ Forged missing Master Tag: [{tag_name}] -> {tag_id}")
+            else:
+                tag_id = result[0]
             
             # Optional cleanup: Wipe the AI Recommendations cleanly before updating the new predicted set
             cleanup_query = text("DELETE FROM recipes_to_tags WHERE tag_id = :tag_id")
