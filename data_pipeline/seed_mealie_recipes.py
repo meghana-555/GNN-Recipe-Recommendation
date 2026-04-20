@@ -7,7 +7,12 @@ import boto3
 from botocore.client import Config
 
 # --- Environment Context ---
-MEALIE_API_URL = os.getenv("MEALIE_BASE_URL", "http://localhost:9000")
+def get_env_url(var_name, docker_default, host_default):
+    val = os.getenv(var_name)
+    if val: return val
+    return docker_default if os.path.exists('/.dockerenv') else host_default
+
+MEALIE_API_URL = get_env_url("MEALIE_BASE_URL", "http://mealie-frontend:9000", "http://localhost:9000")
 MEALIE_TOKEN = os.getenv("MEALIE_API_TOKEN")
 
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")

@@ -9,7 +9,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN mkdir -p /app/local_data
 
 COPY . /app/
-
-# Define an entrypoint that allows easy CLI execution
-ENTRYPOINT ["make"]
-CMD ["help"]
+# No restrictive entrypoint needed since compose defines commands.

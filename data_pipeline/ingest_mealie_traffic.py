@@ -67,14 +67,18 @@ def get_dynamic_max_id(s3, entity_type):
 
 def extract_mealie_data():
     print("--- 2. Connecting to PostgreSQL Mealie Replica ---")
-    connection_string = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+    connection_string = os.getenv("POSTGRES_URL", f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}")
     try:
         engine = create_engine(connection_string)
-        # Note: If Mealie rating structure lacks direct 'recipe_ratings', manual querying on 'recipe_comments' might trigger.
-        df_traffic = pd.read_sql("SELECT * FROM recipe_ratings LIMIT 10", engine)
+        # Query exactly the "users_to_recipes" table to get incremental ratings.
+        df_traffic = pd.read_sql("SELECT user_id AS mealie_user_uuid, recipe_id AS mealie_recipe_uuid, rating, created_at AS date FROM users_to_recipes WHERE rating IS NOT NULL", engine)
+        
+        # Enforce string primitive conversion on python UUID objects for PyArrow compatibility
+        df_traffic['mealie_user_uuid'] = df_traffic['mealie_user_uuid'].astype(str)
+        df_traffic['mealie_recipe_uuid'] = df_traffic['mealie_recipe_uuid'].astype(str)
     except Exception as e:
-        print("Waiting for Mealie schema to populate appropriate tables... Simulating traffic framework.")
-        df_traffic = pd.DataFrame(columns=["user_id", "recipe_id", "rating", "date", "mealie_recipe_uuid", "mealie_user_uuid"])
+        print(f"Mealie Postgres Exception: {e}")
+        df_traffic = pd.DataFrame(columns=["mealie_user_uuid", "mealie_recipe_uuid", "rating", "date"])
         
     return df_traffic
 

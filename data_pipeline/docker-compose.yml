@@ -15,7 +15,7 @@ services:
       - "5432:5432"
 
   mealie:
-    image: ghcr.io/mealie-recipes/mealie:v1.0.0-beta.5
+    image: ghcr.io/mealie-recipes/mealie:latest
     container_name: mealie-frontend
     restart: always
     ports:
@@ -24,50 +24,28 @@ services:
       - DB_ENGINE=postgres
       - POSTGRES_USER=mealie
       - POSTGRES_PASSWORD=mealie_password
-      - POSTGRES_SERVER=postgres
+      - POSTGRES_SERVER=mealie-postgres
       - POSTGRES_PORT=5432
       - POSTGRES_DB=mealie
+      - POSTGRES_URL=postgresql://mealie:mealie_password@mealie-postgres:5432/mealie
       - ALLOW_SIGNUP=true
     depends_on:
       - postgres
     volumes:
       - mealie-app-data:/app/data/
 
-  ingest:
+  data-pipeline:
     build: .
     image: mealie-data
-    container_name: mealie-data-ingest
-    env_file:
-      - .env
-    command: ["python", "ingest_baseline.py"]
-    volumes:
-      - ./local_data:/app/local_data
-
-  traffic-poller:
-    build: .
-    image: mealie-data
-    container_name: mealie-data-poller
+    container_name: data-pipeline-orchestrator
     depends_on:
-      ingest:
-        condition: service_completed_successfully
       postgres:
+        condition: service_started
+      mealie:
         condition: service_started
     env_file:
       - .env
-    command: ["sh", "-c", "while true; do python ingest_mealie_traffic.py; sleep 300; done"]
-    volumes:
-      - ./local_data:/app/local_data
-
-  batch:
-    build: .
-    image: mealie-data
-    container_name: mealie-data-batch
-    depends_on:
-      ingest:
-        condition: service_completed_successfully
-    env_file:
-      - .env
-    command: ["sh", "-c", "while true; do python batch_pipeline.py; sleep 3600; done"]
+    command: ["bash", "orchestrator.sh"]
     volumes:
       - ./local_data:/app/local_data
 

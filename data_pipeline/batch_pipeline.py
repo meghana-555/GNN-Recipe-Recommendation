@@ -28,10 +28,10 @@ def build_data_layer():
     s3 = get_s3_client()
     
     # 1. Fetch historical purely Integer-mapped baseline limits
-    print("Fetching Pre-Processed Component Baselines...")
-    df_base_interactions = load_csv_from_s3(s3, "dataset/historical_baseline/interactions_train.csv")
-    df_pp_users = load_csv_from_s3(s3, "dataset/historical_baseline/PP_users.csv")
-    df_pp_recipes = load_csv_from_s3(s3, "dataset/historical_baseline/PP_recipes.csv")
+    print("Fetching Pre-Processed Component Baselines from Local Mount...")
+    df_base_interactions = pd.read_csv("local_data/interactions_train.csv")
+    df_pp_users = pd.read_csv("local_data/PP_users.csv")
+    df_pp_recipes = pd.read_csv("local_data/PP_recipes.csv")
 
     # Pure execution of dynamic bound fetch based on Kaggle CSV layout format constraints
     base_max_u = int(df_pp_users.iloc[-1]['u'])
