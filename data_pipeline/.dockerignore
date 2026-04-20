@@ -1,0 +1,7 @@
+local_data/
+*.parquet
+*.pt
+*.zip
+*.csv
+__pycache__/
+.git/
