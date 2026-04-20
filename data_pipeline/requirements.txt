@@ -5,3 +5,5 @@ pyarrow==15.0.2
 psycopg2-binary==2.9.9
 SQLAlchemy==2.0.29
 requests==2.31.0
+torch --index-url https://download.pytorch.org/whl/cpu
+torch_geometric
