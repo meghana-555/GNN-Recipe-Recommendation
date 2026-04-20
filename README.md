@@ -30,7 +30,7 @@ docker compose --profile tools run --rm rollback     # manual rollback
 | mlflow | 5000 | training | Experiment tracking + model registry |
 | training | — | training | Training job (profile: training) |
 | feedback-capture | — | training | Pulls Mealie ratings into training data |
-| inference | 8001 | training | Live FastAPI inference service |
+| inference | 8002 | training | Live FastAPI inference service |
 | retrain-orchestrator | 8080 | training | Watch for triggers, promote models |
 | prometheus | 9091 | training | Metrics scraping |
 | grafana | 3000 | training | Dashboards |
@@ -38,12 +38,10 @@ docker compose --profile tools run --rm rollback     # manual rollback
 | redis | 6379 | serving | Pre-computed recs cache |
 | batch | — | serving | GNN batch scorer (on-demand) |
 | api | 8000 | serving | FastAPI serving (Redis-backed) |
-| api-memory | 8001 | serving | FastAPI serving (in-memory) — host-port clash |
+| api-memory | 8001 | serving | FastAPI serving (in-memory) |
 | monitor | 9090 | serving | Metrics + promote/rollback decisions |
 | evaluation | — | serving | Load-testing runner |
 | rollback | — | serving | One-shot rollback tool (profile: tools) |
-
-Note: `api-memory` and `training/inference` both map to host port 8001 after the port-conflict fix. Pick one or remap further if both need to be reachable from the host simultaneously.
 
 ## Environment file
 

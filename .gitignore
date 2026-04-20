@@ -6,6 +6,7 @@ __pycache__/
 # Environment & Credentials
 .env
 .env.local
+data_pipeline/.env
 
 # Data Pipeline temporary & cache
 local_data/

@@ -78,7 +78,7 @@ services:
       dockerfile: Dockerfile.inference
     container_name: mealie-inference
     ports:
-      - "8001:8000"
+      - "8002:8000"
     environment:
       - MODEL_PATH=/app/best_model.pt
       - DATA_PATH=/app/data
