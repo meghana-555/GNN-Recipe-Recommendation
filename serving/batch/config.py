@@ -49,3 +49,9 @@ BATCH_RUN_LOG: str = os.environ.get("BATCH_RUN_LOG", "/logs/batch_run.jsonl")
 # MODEL_DIR lives next to the checkpoint; current_version.txt is written here
 # so the serving side can resolve which artifact set it is loading.
 MODEL_DIR: str = os.path.dirname(MODEL_PATH) or "/models"
+
+# Kaggle credentials for auto-downloading the Food.com dataset on first run.
+# Empty defaults let the container start; the download step errors clearly
+# if these are blank when a download is actually needed.
+KAGGLE_USERNAME: str = os.environ.get("KAGGLE_USERNAME", "")
+KAGGLE_KEY: str = os.environ.get("KAGGLE_KEY", "")

@@ -30,6 +30,8 @@ services:
       RECOMMENDATIONS_OUTPUT: /data/recommendations.json
       BATCH_RUN_LOG: /logs/batch_run.jsonl
       MLFLOW_TRACKING_URI: ""
+      KAGGLE_USERNAME: ""
+      KAGGLE_KEY: ""
     depends_on:
       redis:
         condition: service_healthy

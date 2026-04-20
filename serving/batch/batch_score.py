@@ -49,6 +49,8 @@ from config import (
     CACHE_BACKEND,
     DATA_DIR,
     HIDDEN_CHANNELS,
+    KAGGLE_KEY,
+    KAGGLE_USERNAME,
     MODEL_DIR,
     MODEL_PATH,
     NEG_SAMPLING_RATIO,
@@ -535,6 +537,95 @@ def _append_batch_run(entry: dict) -> None:
         log.warning("Failed to append batch run log to %s: %s", BATCH_RUN_LOG, exc)
 
 
+# Files required for training and scoring — must all be present in DATA_DIR
+# before the pipeline can proceed. The set comes from the notebook's data
+# loading logic (PP_* + interactions_* for the graph, RAW_* for metadata).
+REQUIRED_DATA_FILES = [
+    "PP_recipes.csv",
+    "PP_users.csv",
+    "interactions_train.csv",
+    "interactions_validation.csv",
+    "interactions_test.csv",
+    "RAW_recipes.csv",
+    "RAW_interactions.csv",
+]
+
+
+def ensure_dataset(data_dir: str) -> None:
+    """Ensure all required CSVs are present in *data_dir*, downloading from
+    Kaggle if any are missing. Exits with code 1 on misconfiguration so the
+    container fails fast rather than training on a partial dataset.
+    """
+    missing = [
+        f for f in REQUIRED_DATA_FILES
+        if not os.path.isfile(os.path.join(data_dir, f))
+    ]
+    if not missing:
+        log.info("Data files found, skipping download")
+        return
+
+    log.info(
+        "Missing %d of %d required data files (%s); attempting Kaggle download",
+        len(missing),
+        len(REQUIRED_DATA_FILES),
+        ", ".join(missing),
+    )
+
+    if not KAGGLE_USERNAME or not KAGGLE_KEY:
+        log.error(
+            "KAGGLE_USERNAME and KAGGLE_KEY must be set to download the dataset. "
+            "Either provide them as environment variables or pre-populate %s "
+            "with the required CSVs.",
+            data_dir,
+        )
+        sys.exit(1)
+
+    # The kaggle CLI reads credentials from env vars when set; export here
+    # so that subprocess.run inherits them even if the parent shell lacked them.
+    env = dict(os.environ)
+    env["KAGGLE_USERNAME"] = KAGGLE_USERNAME
+    env["KAGGLE_KEY"] = KAGGLE_KEY
+
+    os.makedirs(data_dir, exist_ok=True)
+
+    try:
+        subprocess.run(
+            [
+                "kaggle", "datasets", "download",
+                "-d", "shuyangli94/food-com-recipes-and-user-interactions",
+                "-p", data_dir,
+                "--unzip",
+            ],
+            check=True,
+            env=env,
+        )
+    except FileNotFoundError:
+        log.error(
+            "kaggle CLI not found on PATH. Install it (pip install kaggle) "
+            "or pre-populate %s with the required CSVs.",
+            data_dir,
+        )
+        sys.exit(1)
+    except subprocess.CalledProcessError as exc:
+        log.error("kaggle download failed (exit=%d): %s", exc.returncode, exc)
+        sys.exit(1)
+
+    # Re-check after download — if Kaggle's archive layout ever changes we
+    # want to fail here rather than deep inside pandas.read_csv.
+    still_missing = [
+        f for f in REQUIRED_DATA_FILES
+        if not os.path.isfile(os.path.join(data_dir, f))
+    ]
+    if still_missing:
+        log.error(
+            "Kaggle download completed but files are still missing: %s",
+            ", ".join(still_missing),
+        )
+        sys.exit(1)
+
+    log.info("Data files downloaded successfully")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Batch pre-computation for GNN recommender")
     parser.add_argument("--dry-run", action="store_true",
@@ -548,6 +639,10 @@ def main() -> None:
     log.info("DATA_DIR: %s", DATA_DIR)
     log.info("CACHE_BACKEND: %s", CACHE_BACKEND)
     log.info("TOP_N: %d, BATCH_SIZE: %d", TOP_N, BATCH_SIZE)
+
+    # Dataset must exist before either training or scoring; do this first so
+    # a missing-file failure shows up immediately, not 10+ minutes into training.
+    ensure_dataset(DATA_DIR)
 
     # ------------------------------------------------------------------
     # Step 1: Ensure a trained model exists
