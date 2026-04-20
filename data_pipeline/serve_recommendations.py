@@ -234,10 +234,6 @@ def inject_tags_via_database(recipe_uuids):
 
 
 if __name__ == "__main__":
-    if not MEALIE_TOKEN:
-        print("ERROR: MEALIE_API_TOKEN environment variable not set. Please set it in .env")
-        exit(1)
-        
     s3 = get_s3_client()
     registry = pd.DataFrame()
     try:
