@@ -7,8 +7,8 @@ def get_token():
     if os.getenv("MEALIE_API_TOKEN"):
         return os.getenv("MEALIE_API_TOKEN")
 
-    email = os.getenv("MEALIE_ADMIN_EMAIL")
-    password = os.getenv("MEALIE_ADMIN_PASSWORD")
+    email = os.getenv("MEALIE_ADMIN_EMAIL", "").strip('"').strip("'")
+    password = os.getenv("MEALIE_ADMIN_PASSWORD", "").strip('"').strip("'")
     url = os.getenv("MEALIE_BASE_URL", "http://mealie-frontend:9000")
     
     if not email or not password:
