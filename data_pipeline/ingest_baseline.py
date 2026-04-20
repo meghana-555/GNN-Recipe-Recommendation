@@ -34,7 +34,7 @@ def check_s3_already_exists():
     print("--- 0. Checking S3 for Existing Baseline ---")
     s3 = boto3.client('s3', aws_access_key_id=ACCESS_KEY, aws_secret_access_key=SECRET_KEY, endpoint_url=ENDPOINT_URL, config=Config(signature_version='s3v4'), region_name='us-east-1')
     try:
-        s3.head_object(Bucket=BUCKET_NAME, Key="dataset/historical_baseline/RAW_interactions.parquet")
+        s3.head_object(Bucket=BUCKET_NAME, Key="dataset/historical_baseline/RAW_interactions.csv")
         s3.head_object(Bucket=BUCKET_NAME, Key="dataset/historical_baseline/PP_recipes.csv")
         print("✅ Full Baseline already exists on S3. Skipping ingestion.")
         sys.exit(0)
@@ -105,8 +105,8 @@ def evaluate_and_format(dest_path):
     df['user_id'] = 'user:' + df['user_id'].astype(str)
     df['recipe_id'] = 'recipe:' + df['recipe_id'].astype(str)
 
-    output_path_interactions = f"{dest_path}/processed_baseline_interactions.parquet"
-    df.to_parquet(output_path_interactions, index=False)
+    output_path_interactions = f"{dest_path}/processed_baseline_interactions.csv"
+    df.to_csv(output_path_interactions, index=False)
     
     # --- Process Recipes ---
     recipes_path = f"{dest_path}/RAW_recipes.csv"
@@ -116,8 +116,8 @@ def evaluate_and_format(dest_path):
         df_rec['id'] = 'recipe:' + df_rec['id'].astype(str)
         if 'contributor_id' in df_rec.columns:
             df_rec['contributor_id'] = 'user:' + df_rec['contributor_id'].astype(str)
-        output_path_recipes = f"{dest_path}/processed_baseline_recipes.parquet"
-        df_rec.to_parquet(output_path_recipes, index=False)
+        output_path_recipes = f"{dest_path}/processed_baseline_recipes.csv"
+        df_rec.to_csv(output_path_recipes, index=False)
     else:
         print("Warning: RAW_recipes.csv not found, skipping recipe metadata processing.")
         output_path_recipes = None
@@ -130,14 +130,14 @@ def upload_to_chameleon(interactions_path, recipes_path):
     
     s3 = boto3.client('s3', aws_access_key_id=ACCESS_KEY, aws_secret_access_key=SECRET_KEY, endpoint_url=ENDPOINT_URL, config=Config(signature_version='s3v4'), region_name='us-east-1')
     
-    # Store explicitly as Parquet
-    s3_key_interactions = "dataset/historical_baseline/RAW_interactions.parquet"
+    # Store explicitly as CSV
+    s3_key_interactions = "dataset/historical_baseline/RAW_interactions.csv"
     print(f"Uploading {interactions_path} to {s3_key_interactions}")
     
     try:
         s3.upload_file(interactions_path, BUCKET_NAME, s3_key_interactions, Config=transfer_config)
         if recipes_path and os.path.exists(recipes_path):
-            s3_key_recipes = "dataset/historical_baseline/RAW_recipes.parquet"
+            s3_key_recipes = "dataset/historical_baseline/RAW_recipes.csv"
             print(f"Uploading {recipes_path} to {s3_key_recipes}")
             s3.upload_file(recipes_path, BUCKET_NAME, s3_key_recipes, Config=transfer_config)
             
