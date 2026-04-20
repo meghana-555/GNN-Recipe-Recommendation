@@ -1,6 +1,38 @@
 version: "3.8"
 
 services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: mealie-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: mealie
+      POSTGRES_PASSWORD: mealie_password
+      POSTGRES_DB: mealie
+    volumes:
+      - mealie-db-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  mealie:
+    image: ghcr.io/mealie-recipes/mealie:v1.0.0-beta.5
+    container_name: mealie-frontend
+    restart: always
+    ports:
+      - "9000:9000"
+    environment:
+      - DB_ENGINE=postgres
+      - POSTGRES_USER=mealie
+      - POSTGRES_PASSWORD=mealie_password
+      - POSTGRES_SERVER=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=mealie
+      - ALLOW_SIGNUP=true
+    depends_on:
+      - postgres
+    volumes:
+      - mealie-app-data:/app/data/
+
   ingest:
     build: .
     image: mealie-data
@@ -11,19 +43,23 @@ services:
     volumes:
       - ./local_data:/app/local_data
 
-  generator:
+  traffic-poller:
+    build: .
     image: mealie-data
-    container_name: mealie-data-generator
+    container_name: mealie-data-poller
     depends_on:
       ingest:
         condition: service_completed_successfully
+      postgres:
+        condition: service_started
     env_file:
       - .env
-    command: ["python", "-c", "import generator; generator.run_generator(duration_minutes=0)"]
+    command: ["sh", "-c", "while true; do python ingest_mealie_traffic.py; sleep 300; done"]
     volumes:
       - ./local_data:/app/local_data
 
   batch:
+    build: .
     image: mealie-data
     container_name: mealie-data-batch
     depends_on:
@@ -34,3 +70,7 @@ services:
     command: ["sh", "-c", "while true; do python batch_pipeline.py; sleep 3600; done"]
     volumes:
       - ./local_data:/app/local_data
+
+volumes:
+  mealie-db-data:
+  mealie-app-data:

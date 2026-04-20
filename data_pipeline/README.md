@@ -3,42 +3,52 @@
 This repository contains the Data Integration system for linking Mealie to an offline Graph Neural Network (GraphSAGE) recommendation system.
 
 ## 1. Components & Automated Workflow
-The data components are built to be robust, fully dockerized, and automated via standard CLI commands.
-- `ingest_baseline.py` (`make ingest-baseline`): Fetches the raw `food-com-recipes-and-user-interactions` from Kaggle, applies ingestion evaluation checks, formatting logic, handles <5GB synthetic expansion, and writes to Chameleon Object Store as our **Historical Baseline**.
-- `generator.py` (`make run-generator`): Simulates continuous traffic by logging incremental JSON events mapping exactly to Mealie's webhook schema towards S3 object store.
-- `batch_pipeline.py` (`make run-batch`): Offline sync. Merges baseline and simulation data, mathematically verifies split logic to prevent data leakage across train and eval sets, validates distribution qualities, and stages the splits for the Training member.
+The data components are built to be robust, fully dockerized, and automated via standard Docker Compose workflows.
+- `ingest_baseline.py`: Fetches the raw `food-com-recipes-and-user-interactions` from Kaggle, applies ingestion evaluation checks, formatting logic, handles <5GB synthetic expansion, and writes to Chameleon Object Store as our **Historical Baseline**.
+- `ingest_mealie_traffic.py` (Traffic Poller): Connects directly to the live PostgreSQL Mealie Database to sync real human usage. Automatically translates Mealie UUIDs to ML sequential Integers via our S3 Registry State Machine, and pushes to `production_traffic/`.
+- `batch_pipeline.py`: Offline sync. Merges baseline and exact production traffic data, mathematically verifies split logic to prevent data leakage across train and eval sets, validates distribution qualities, and stages the splits for the Training member.
 - `online_features.py` : Invoked real-time by the Serving layer to gather metrics representing user contexts in production.
 
-## 2. Schema Alignment
+*(Note: `generator.py` is safely preserved strictly as a legacy emulator script.)*
+
+## 2. Schema Alignment & S3 ID Translation Registry
 
 To seamlessly synchronize Kaggle's pure integer schemas with Mealie's UUID-heavy application schema and the strict Inference API protocol:
 - Datasets convert `user_id` to prefixed string format (`"user:38094"`).
-- Synthetic event pipelines map field shapes to standard Mealie interactions.
+- Our Traffic Poller retrieves a global state map `id_mapping_registry.parquet` from S3. New Mealie interactions are cross-referenced, retaining memory of Old Kaggle items while safely mutating brand new interaction UUIDs into strictly typed ML Integer ID representations.
 
 ### Data Flow Diagram
 
 ```mermaid
 flowchart TD
+    subgraph DevOps App Boundary
+        Postgres[(PostgreSQL\nInstance)]
+        MealieApp[Mealie Web UI]
+        MealieApp <--> Postgres
+    end
+
     subgraph Data Boundaries
         Kaggle["Kaggle (food-com)"]
         Ingest["ingest_baseline.py"]
-        Gen["generator.py"]
-        OnlineFeat["online_features.py"]
+        Poller["ingest_mealie_traffic.py"]
         Batch["batch_pipeline.py"]
-        S3Base[("S3: /dataset/historical_baseline/")]
-        S3Sim[("S3: /simulation/")]
+        S3Reg[("S3: /dataset/registry/")]
+        S3Base[("S3: /historical_baseline/")]
+        S3Traffic[("S3: /production_traffic/")]
     end
     
-    subgraph S3 Integrations
+    subgraph S3 Output
         S3Train[("S3: /train/")]
         S3Eval[("S3: /evaluation/")]
     end
 
-    Kaggle -->|Download + Expand| Ingest
-    Ingest -->|Validate & Write| S3Base
-    Gen -->|Incremental Batches| S3Sim
+    Kaggle --> Ingest
+    Ingest --> S3Base
+    Postgres --> Poller
+    Poller <--> S3Reg
+    Poller --> S3Traffic
     S3Base --> Batch
-    S3Sim --> Batch
+    S3Traffic --> Batch
     Batch == "Split strictly by Time" ==> S3Train
     Batch == "Split strictly by Time" ==> S3Eval
 ```
@@ -46,9 +56,9 @@ flowchart TD
 ## 3. Data Versioning
 
 Our Chameleon object storage (`ObjStore_proj14`) applies versioning folders structurally:
-- Baseline: Immutable at `dataset/historical_baseline/interactions.csv`
-- Simulations: `simulation/YYYYMMDD_HHMM/batch.json`
-- Offline Target: `train/YYYYMMDD_HHMM/train.csv`
+- Baseline: Immutable at `dataset/historical_baseline/RAW_interactions.parquet`
+- Traffic: `production_traffic/YYYYMMDD_HHMM/batch.parquet`
+- Offline Target: `train/YYYYMMDD_HHMM/train.parquet`
 
 ## 4. Evaluation and Monitoring Strategy
 1. **At Ingestion**: Real-time evaluation detecting missing core columns (`user_id`, `recipe_id`, `rating`) or unapproved scale ranges.
@@ -57,58 +67,26 @@ Our Chameleon object storage (`ObjStore_proj14`) applies versioning folders stru
 
 ## 5. Execution Tutorial (Chameleon VM Quickstart)
 
-If you have just launched a fresh Chameleon Ubuntu VM, follow these exact steps to run and test the complete pipeline.
+If you have just launched a fresh Chameleon Ubuntu VM, follow these exact steps to launch the entire Mealie app, PostgreSQL, baseline ingestion, and the periodic scheduling queues **all dynamically integrated**.
 
-### Step 1: Clone & Configure Credentials
-First, setup your Object Storage env variables and optional dataset URL inside your VM.
+### Step 1: Configure Credentials
 ```bash
 # Setup AWS/Object Store credentials in a .env file
-cat <<EOF > data/.env
-# Optional: Override the fallback default download Kaggle ZIP link via Curl
-DATASET_URL=https://www.kaggle.com/api/v1/datasets/download/shuyangli94/food-com-recipes-and-user-interactions
-
-# Required: S3 Auth
-AWS_ACCESS_KEY_ID=YOUR_AWS_ACCESS_KEY_HERE
-AWS_SECRET_ACCESS_KEY=YOUR_AWS_SECRET_KEY_HERE
-AWS_ENDPOINT_URL=https://chi.tacc.chameleoncloud.org:7480
-S3_BUCKET_NAME=ObjStore_proj14
-BATCH_INTERVAL=3600
-EOF
+cp .env.template .env
+# Edit the .env to insert your S3 keys:
+nano .env 
 ```
 
-### Step 2: Build the Main Container
-Inside the `/data` folder, build the automation environment:
+### Step 2: One-Command Execution!
+We have fully automated the entire microservice lifecycle (Web UI, Data DB, Baseline Scripts, Poller, and Batch pipeline) via Docker Compose. Run this single command from within the `data_pipeline/` directory:
+
 ```bash
-cd data/
-docker build -t mealie-data .
+docker compose up --build -d
 ```
 
-### Step 3: Run the Tests & Pipeline
-
-**Test 1: Run the Kaggle Ingestion (Seed Historical Data)**
-This downloads the data to your VM, validates the schema (raising alerts if data quality fails), formats it to match Mealie, and uploads it to S3.
-```bash
-docker run --rm --env-file .env mealie-data ingest-baseline
-```
-*Success criteria: Console prints `✅ Baseline Ingestion COMPLETE.`*
-
-**Test 2: Simulate Live Web Application Traffic (Generator)**
-Starts creating synthetic logs representing new users interacting with recipes.
-```bash
-docker run --rm --env-file .env mealie-data run-generator
-```
-*Success criteria: Console repeatedly prints `Uploading simulation batch...` for a minute.*
-
-**Test 3: Compute the Offline Training Sync (Batch Pipeline)**
-Merges the Kaggle baseline from Step 1 with the simulated weblogs from Step 2, evaluates for data leakage, and outputs the `/train` & `/eval` splits to the S3 bucket.
-```bash
-docker run --rm --env-file .env mealie-data run-batch
-```
-*Success criteria: Prints `✅ Leakage Prevention Verified: Train timestamps strictly before Eval timestamps.` and saves the splits successfully to Object storage.*
-
-**Test 4: Serving System Inference Test (Online Features)**
-Tests the exact payload expected by the Serving Layer directly against the `online_features.py` module.
-```bash
-docker run --rm --env-file .env --entrypoint python mealie-data online_features.py
-```
-*Success criteria: Outputs a strictly typed JSON payload responding to `{"user_id": "user:13751"}` and silently logs the query metrics to S3 `monitoring` for drift tracking.*
+### What happens now?
+- **Port 9000** on your Chameleon VM will now correctly serve your real live Mealie Application.
+- **Port 5432** serves the persistent Postgres database locally.
+- A background `ingest` container immediately runs to grab the baseline from Kaggle and deposits it to S3, then peacefully exits.
+- A background `traffic-poller` wakes up and constantly crawls PostgreSQL for updates, translating UUIDs.
+- A background `batch` processor runs fully automated cycles every 1 hour to output splits.
