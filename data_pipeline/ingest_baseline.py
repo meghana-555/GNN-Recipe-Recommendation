@@ -35,11 +35,12 @@ def check_s3_already_exists():
     s3 = boto3.client('s3', aws_access_key_id=ACCESS_KEY, aws_secret_access_key=SECRET_KEY, endpoint_url=ENDPOINT_URL, config=Config(signature_version='s3v4'), region_name='us-east-1')
     try:
         s3.head_object(Bucket=BUCKET_NAME, Key="dataset/historical_baseline/RAW_interactions.parquet")
-        print("✅ Baseline already exists on S3. Skipping ingestion.")
+        s3.head_object(Bucket=BUCKET_NAME, Key="dataset/historical_baseline/PP_recipes.csv")
+        print("✅ Full Baseline already exists on S3. Skipping ingestion.")
         sys.exit(0)
     except botocore.exceptions.ClientError as e:
         if e.response['Error']['Code'] == "404":
-            print("Baseline not found on S3. Proceeding with ingestion...")
+            print("Baseline artifacts missing on S3. Proceeding with robust ingestion...")
         else:
             raise e
 
@@ -139,6 +140,16 @@ def upload_to_chameleon(interactions_path, recipes_path):
             s3_key_recipes = "dataset/historical_baseline/RAW_recipes.parquet"
             print(f"Uploading {recipes_path} to {s3_key_recipes}")
             s3.upload_file(recipes_path, BUCKET_NAME, s3_key_recipes, Config=transfer_config)
+            
+        print("Uploading secondary pre-processed Kaggle artifacts...")
+        extra_files = ["PP_users.csv", "PP_recipes.csv", "interactions_train.csv", "interactions_validation.csv", "interactions_test.csv"]
+        for f in extra_files:
+            f_path = f"local_data/{f}"
+            if os.path.exists(f_path):
+                key = f"dataset/historical_baseline/{f}"
+                print(f"Uploading {f_path} to {key}")
+                s3.upload_file(f_path, BUCKET_NAME, key, Config=transfer_config)
+                
         print("✅ Baseline Ingestion COMPLETE.")
     except Exception as e:
         print(f"❌ Failed to upload: {e}")
