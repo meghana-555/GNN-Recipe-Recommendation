@@ -53,3 +53,7 @@ services:
 volumes:
   mealie-db-data:
   mealie-app-data:
+
+networks:
+  default:
+    name: mealie-ml-network

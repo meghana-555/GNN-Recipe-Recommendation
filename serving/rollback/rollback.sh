@@ -21,3 +21,35 @@ fi
 
 cp "$BACKUP" "$MODEL"
 echo "rollback: restored $MODEL from $BACKUP"
+
+# ---------------------------------------------------------------------------
+# Second stage: MLflow model-registry stage change.
+#
+# The file swap above is authoritative — if this stage fails for any reason,
+# the rollback is still considered applied locally and the script must exit 0.
+# rollback_manager.py comes from a volume mount provided by the root compose
+# file; when running the sub-compose standalone it will not be present, and
+# we skip this stage with a log line.
+# ---------------------------------------------------------------------------
+
+ROLLBACK_MANAGER="/training/rollback_manager.py"
+
+mlflow_set="unset"
+if [[ -n "${MLFLOW_TRACKING_URI:-}" ]]; then
+    mlflow_set="set"
+fi
+
+manager_present="absent"
+if [[ -f "$ROLLBACK_MANAGER" ]]; then
+    manager_present="present"
+fi
+
+if [[ "$mlflow_set" == "set" && "$manager_present" == "present" ]]; then
+    REASON="serving rollback script invoked at $(date -u +%FT%TZ)"
+    python "$ROLLBACK_MANAGER" --action rollback --reason "$REASON" \
+        || echo "rollback: MLflow stage change failed (non-fatal) — file swap still applied"
+else
+    echo "rollback: MLflow integration skipped (MLFLOW_TRACKING_URI=${mlflow_set}, rollback_manager=${manager_present})"
+fi
+
+exit 0

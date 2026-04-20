@@ -3,3 +3,4 @@ uvicorn[standard]>=0.29,<1
 pydantic>=2.0,<3
 pydantic-settings>=2.0,<3
 redis>=5.0,<6
+mlflow>=2.9,<3

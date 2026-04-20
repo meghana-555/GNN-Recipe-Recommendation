@@ -5,6 +5,7 @@ __pycache__/
 
 # Environment & Credentials
 .env
+.env.local
 
 # Data Pipeline temporary & cache
 local_data/
@@ -16,6 +17,3 @@ local_data/
 # Serving Logs & Evaluation Results
 logs/
 results/
-
-__pycache__/
-*.pyc

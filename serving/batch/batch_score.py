@@ -41,6 +41,17 @@ from torch_geometric.data import HeteroData
 from torch_geometric.loader import LinkNeighborLoader
 from tqdm import tqdm
 
+try:
+    import boto3
+    from botocore.client import Config as BotoConfig
+    from botocore.exceptions import ClientError
+    _BOTO3_AVAILABLE = True
+except ImportError:
+    boto3 = None  # type: ignore[assignment]
+    BotoConfig = None  # type: ignore[assignment]
+    ClientError = Exception  # type: ignore[assignment,misc]
+    _BOTO3_AVAILABLE = False
+
 # Local imports
 from config import (
     BATCH_RUN_LOG,
@@ -58,6 +69,10 @@ from config import (
     RECOMMENDATIONS_OUTPUT,
     REDIS_HOST,
     REDIS_PORT,
+    S3_ACCESS_KEY,
+    S3_BUCKET,
+    S3_ENDPOINT_URL,
+    S3_SECRET_KEY,
     TOP_K_INGREDIENTS,
     TOP_N,
     TRAIN_BATCH_SIZE,
@@ -550,9 +565,62 @@ REQUIRED_DATA_FILES = [
 ]
 
 
+def _download_from_s3(data_dir: str, missing: list[str]) -> list[str]:
+    """Attempt to download missing files from S3. Returns the list of files
+    still missing after the attempt. Prints which source was used."""
+    if not (S3_ENDPOINT_URL and S3_ACCESS_KEY and S3_SECRET_KEY and S3_BUCKET):
+        log.info("S3 credentials not set — skipping S3 fetch")
+        return list(missing)
+
+    if not _BOTO3_AVAILABLE:
+        log.warning("boto3 not available — skipping S3 fetch")
+        return list(missing)
+
+    os.makedirs(data_dir, exist_ok=True)
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=S3_ENDPOINT_URL,
+        aws_access_key_id=S3_ACCESS_KEY,
+        aws_secret_access_key=S3_SECRET_KEY,
+        config=BotoConfig(signature_version="s3v4"),
+        region_name="us-east-1",
+    )
+
+    total = len(missing)
+    still_missing: list[str] = []
+    successes = 0
+    for fname in missing:
+        key = f"dataset/historical_baseline/{fname}"
+        dest = os.path.join(data_dir, fname)
+        try:
+            s3.download_file(S3_BUCKET, key, dest)
+            successes += 1
+            log.info("Fetched %s from S3 (%s)", fname, key)
+        except ClientError as exc:
+            # RAW_interactions.csv is not in the S3 baseline; RAW_recipes.csv
+            # may also be absent. Both are handled via the Kaggle fallback.
+            if fname == "RAW_recipes.csv":
+                log.info(
+                    "RAW_recipes.csv not present in S3 baseline (expected); "
+                    "will try Kaggle fallback"
+                )
+            else:
+                log.warning(
+                    "S3 download failed for %s: %s", fname, exc
+                )
+            still_missing.append(fname)
+        except Exception as exc:  # noqa: BLE001 — network/config failures
+            log.warning("S3 download failed for %s: %s", fname, exc)
+            still_missing.append(fname)
+
+    log.info("Data files downloaded from S3 (%d/%d)", successes, total)
+    return still_missing
+
+
 def ensure_dataset(data_dir: str) -> None:
-    """Ensure all required CSVs are present in *data_dir*, downloading from
-    Kaggle if any are missing. Exits with code 1 on misconfiguration so the
+    """Ensure all required CSVs are present in *data_dir*, trying S3 first
+    and falling back to Kaggle. Exits with code 1 on misconfiguration so the
     container fails fast rather than training on a partial dataset.
     """
     missing = [
@@ -564,10 +632,26 @@ def ensure_dataset(data_dir: str) -> None:
         return
 
     log.info(
-        "Missing %d of %d required data files (%s); attempting Kaggle download",
+        "Missing %d of %d required data files (%s); attempting S3 fetch first",
         len(missing),
         len(REQUIRED_DATA_FILES),
         ", ".join(missing),
+    )
+
+    initial_missing_count = len(missing)
+    still_missing = _download_from_s3(data_dir, missing)
+    s3_success_count = initial_missing_count - len(still_missing)
+    used_s3 = s3_success_count > 0
+
+    if not still_missing:
+        log.info("All missing files satisfied by S3")
+        log.info("Data acquisition complete (source=s3)")
+        return
+
+    log.info(
+        "Still missing %d file(s) after S3 (%s); attempting Kaggle download",
+        len(still_missing),
+        ", ".join(still_missing),
     )
 
     if not KAGGLE_USERNAME or not KAGGLE_KEY:
@@ -611,18 +695,20 @@ def ensure_dataset(data_dir: str) -> None:
 
     # Re-check after download — if Kaggle's archive layout ever changes we
     # want to fail here rather than deep inside pandas.read_csv.
-    still_missing = [
+    final_missing = [
         f for f in REQUIRED_DATA_FILES
         if not os.path.isfile(os.path.join(data_dir, f))
     ]
-    if still_missing:
+    if final_missing:
         log.error(
             "Kaggle download completed but files are still missing: %s",
-            ", ".join(still_missing),
+            ", ".join(final_missing),
         )
         sys.exit(1)
 
+    source = "mixed" if used_s3 else "kaggle"
     log.info("Data files downloaded successfully")
+    log.info("Data acquisition complete (source=%s)", source)
 
 
 def main() -> None:

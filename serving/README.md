@@ -87,6 +87,14 @@ Retraining is a host-level cron job, not a long-running container - we did not w
 
 After the batch run, call `GET http://localhost:9090/promote-decision` to emit the PROMOTE, ROLLBACK, or HOLD for the fresh model. If the decision is ROLLBACK, run `docker compose --profile tools run --rm rollback` to swap `.pt.backup` back to `.pt` and bounce `api`.
 
+## Rollback paths
+
+There are two rollback mechanisms in this repository; which one you want depends on whether the failing model was registered in MLflow and how much audit trail you need.
+
+- Fast local rollback — `docker compose --profile tools run --rm rollback`. Swaps `.pt.backup` → `.pt` on the shared models volume. Takes effect for `api` on the next request that reads the file; if the API caches the model in memory, a restart of the `api` service is also required. Use when: operational failure, a quick revert is needed, or MLflow is unreachable.
+- Full registry rollback — `python training/rollback_manager.py --action rollback --reason "<reason>"`. Transitions the MLflow model registry Production stage back to the prior version, writes audit entries to `rollback/` in object storage, and (if configured) triggers a Kubernetes deploy rollback. Use when: a tracked model version was registered in MLflow and you want the full audit trail.
+- Combined — when `MLFLOW_TRACKING_URI` is set AND the `rollback` container has `training/rollback_manager.py` mounted at `/training/`, the `rollback.sh` script runs both steps in order: the file swap first, then the MLflow stage change. The file swap is authoritative — if the MLflow step fails, the rollback is still considered applied locally and a non-fatal warning is logged.
+
 ## Right-sizing on Chameleon
 
 - `api` container: ~200MB resident, <10% CPU under 20 concurrent users. A single `m1.medium` node handles the full Mealie population with headroom.

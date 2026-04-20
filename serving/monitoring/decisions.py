@@ -3,6 +3,9 @@
 Pure function over a metrics snapshot and a FeedbackStore; the caller
 owns persistence so this module can be unit-tested without filesystem
 side effects.
+
+MLflow logging is best-effort — the endpoint's response is unaffected
+by MLflow availability.
 """
 
 from __future__ import annotations
@@ -47,10 +50,42 @@ def _rel_drop(recent: float, prior: float) -> float:
     return max(0.0, (prior - recent) / prior)
 
 
+def _mirror_to_mlflow(
+    mlflow_tracking_uri: str,
+    decision: str,
+    justification: str,
+    ts_iso: str,
+    metrics_for_return: dict[str, Any],
+) -> None:
+    """Best-effort mirror of a decision to MLflow; never raises.
+
+    Any failure (missing package, network, auth, version mismatch) is
+    swallowed so the monitor's /promote-decision endpoint stays green
+    regardless of MLflow availability.
+    """
+    try:
+        try:
+            import mlflow
+        except ImportError:
+            return
+        mlflow.set_tracking_uri(mlflow_tracking_uri)
+        mlflow.set_experiment("serving-decisions")
+        with mlflow.start_run(run_name=f"decision-{decision}") as run:
+            mlflow.set_tag("decision", decision)
+            mlflow.set_tag("justification", justification)
+            mlflow.set_tag("timestamp", ts_iso)
+            for k, v in metrics_for_return.items():
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    mlflow.log_metric(k, float(v))
+    except Exception:
+        return
+
+
 def evaluate(
     rolling_snapshot: dict[str, Any],
     feedback: FeedbackStore,
     now: datetime,
+    mlflow_tracking_uri: str | None = None,
 ) -> dict[str, Any]:
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -94,57 +129,63 @@ def evaluate(
 
     ts_iso = now.astimezone(timezone.utc).isoformat()
 
-    # Operational failures win over everything else — bad latency/errors
-    # trump rating-based signals because users can't rate what they can't see.
-    if error_rate > ERROR_RATE_ROLLBACK:
+    def _finalize(decision: str, justification: str) -> dict[str, Any]:
+        if mlflow_tracking_uri:
+            _mirror_to_mlflow(
+                mlflow_tracking_uri,
+                decision,
+                justification,
+                ts_iso,
+                metrics_for_return,
+            )
         return {
-            "decision": "rollback",
-            "justification": (
-                f"error_rate {error_rate:.3f} exceeds threshold {ERROR_RATE_ROLLBACK}"
-            ),
+            "decision": decision,
+            "justification": justification,
             "metrics": metrics_for_return,
             "timestamp": ts_iso,
         }
 
+    # Operational failures win over everything else — bad latency/errors
+    # trump rating-based signals because users can't rate what they can't see.
+    if error_rate > ERROR_RATE_ROLLBACK:
+        return _finalize(
+            "rollback",
+            f"error_rate {error_rate:.3f} exceeds threshold {ERROR_RATE_ROLLBACK}",
+        )
+
     # Below MIN_FEEDBACK_COUNT the rating- and engagement-based rules are
     # statistically unreliable, so hold rather than fire either direction.
     if recent_feedback_count < MIN_FEEDBACK_COUNT:
-        return {
-            "decision": "hold",
-            "justification": (
+        return _finalize(
+            "hold",
+            (
                 f"insufficient feedback (count={recent_feedback_count} "
                 f"< MIN_FEEDBACK_COUNT={MIN_FEEDBACK_COUNT})"
             ),
-            "metrics": metrics_for_return,
-            "timestamp": ts_iso,
-        }
+        )
 
     if (
         recent_avg_rating is not None
         and baseline_avg_rating is not None
         and (baseline_avg_rating - recent_avg_rating) > RATING_DROP_ROLLBACK
     ):
-        return {
-            "decision": "rollback",
-            "justification": (
+        return _finalize(
+            "rollback",
+            (
                 f"avg_rating dropped {baseline_avg_rating - recent_avg_rating:.3f} "
                 f"vs {BASELINE_DAYS}d baseline (> {RATING_DROP_ROLLBACK})"
             ),
-            "metrics": metrics_for_return,
-            "timestamp": ts_iso,
-        }
+        )
 
     if _rel_drop(recent_fb_rate, prior_fb_rate) > FEEDBACK_RATE_DROP:
-        return {
-            "decision": "rollback",
-            "justification": (
+        return _finalize(
+            "rollback",
+            (
                 f"feedback_rate dropped "
                 f"{_rel_drop(recent_fb_rate, prior_fb_rate):.1%} vs prior "
                 f"{RECENT_DAYS}d (> {FEEDBACK_RATE_DROP:.0%})"
             ),
-            "metrics": metrics_for_return,
-            "timestamp": ts_iso,
-        }
+        )
 
     rating_improved = (
         recent_avg_rating is not None
@@ -154,28 +195,24 @@ def evaluate(
     precision_improved = recent_p_at_10 > prior_p_at_10
 
     if rating_improved and precision_improved:
-        return {
-            "decision": "promote",
-            "justification": (
+        return _finalize(
+            "promote",
+            (
                 f"precision@10 {recent_p_at_10:.3f} > prior {prior_p_at_10:.3f} "
                 f"and avg_rating improved "
                 f"{(recent_avg_rating or 0) - (prior_avg_rating or 0):.3f} "
                 f"(> {RATING_IMPROVE_PROMOTE})"
             ),
-            "metrics": metrics_for_return,
-            "timestamp": ts_iso,
-        }
+        )
 
-    return {
-        "decision": "hold",
-        "justification": (
+    return _finalize(
+        "hold",
+        (
             f"no threshold crossed: error_rate={error_rate:.3f}, "
             f"recent_rating={recent_avg_rating}, prior_rating={prior_avg_rating}, "
             f"p@10_recent={recent_p_at_10:.3f}, p@10_prior={prior_p_at_10:.3f}"
         ),
-        "metrics": metrics_for_return,
-        "timestamp": ts_iso,
-    }
+    )
 
 
 def _ts(raw: Any) -> datetime | None:

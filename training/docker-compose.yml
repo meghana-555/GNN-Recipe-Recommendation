@@ -78,7 +78,7 @@ services:
       dockerfile: Dockerfile.inference
     container_name: mealie-inference
     ports:
-      - "8000:8000"
+      - "8001:8000"
     environment:
       - MODEL_PATH=/app/best_model.pt
       - DATA_PATH=/app/data
@@ -123,7 +123,7 @@ services:
     image: prom/prometheus:v2.47.0
     container_name: prometheus
     ports:
-      - "9090:9090"
+      - "9091:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
@@ -176,6 +176,8 @@ services:
 networks:
   mealie-ml:
     driver: bridge
+    name: mealie-ml-network
+  default:
     name: mealie-ml-network
 
 volumes:

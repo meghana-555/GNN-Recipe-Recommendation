@@ -1,0 +1,33 @@
+# Root orchestrator for the full Mealie GNN recommender stack.
+#
+# Brings up three role-owned sub-composes on a shared Docker network
+# (mealie-ml-network):
+#
+#   data_pipeline/  — Mealie frontend + Postgres + data ingestion
+#   training/       — MLflow + training + inference + Prometheus/Grafana
+#   serving/        — Redis + batch + FastAPI + monitor + rollback
+#
+# Startup order (enforced via depends_on inside each sub-compose):
+#   1. postgres, redis           (infrastructure)
+#   2. mealie                    (depends on postgres)
+#   3. mlflow                    (independent)
+#   4. data-pipeline orchestrator (depends on mealie, postgres)
+#   5. training service          (depends on mlflow — profile "training")
+#   6. serving api + monitor     (depends on redis)
+#
+# Shared environment variables (set in root .env):
+#   MEALIE_BASE_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+#   AWS_ENDPOINT_URL, S3_BUCKET_NAME, MLFLOW_TRACKING_URI, REDIS_HOST,
+#   CHAMELEON_ACCESS_KEY, CHAMELEON_SECRET_KEY, KAGGLE_USERNAME, KAGGLE_KEY,
+#   MEALIE_ADMIN_EMAIL, MEALIE_ADMIN_PASSWORD, MEALIE_API_TOKEN
+#
+# Usage:
+#   cp .env.example .env   # edit with real credentials
+#   docker compose up -d
+#
+# See ROOT_README.md for demo walkthrough and per-stack deep links.
+
+include:
+  - path: ./data_pipeline/docker-compose.yml
+  - path: ./training/docker-compose.yml
+  - path: ./serving/docker-compose.yml

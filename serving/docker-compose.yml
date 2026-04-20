@@ -31,6 +31,10 @@ services:
       MLFLOW_TRACKING_URI: ""
       KAGGLE_USERNAME: ""
       KAGGLE_KEY: ""
+      S3_ENDPOINT_URL: ""
+      S3_ACCESS_KEY: ""
+      S3_SECRET_KEY: ""
+      S3_BUCKET: ""
     depends_on:
       redis:
         condition: service_healthy
@@ -103,6 +107,7 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       EXPECTED_USER_COUNT: "0"
+      MLFLOW_TRACKING_URI: http://mlflow:5000
     depends_on:
       redis:
         condition: service_healthy
@@ -119,3 +124,7 @@ services:
       - ./models:/models
     profiles:
       - tools
+
+networks:
+  default:
+    name: mealie-ml-network

@@ -54,3 +54,8 @@ MODEL_DIR: str = os.path.dirname(MODEL_PATH) or "/models"
 # if these are blank when a download is actually needed.
 KAGGLE_USERNAME: str = os.environ.get("KAGGLE_USERNAME", "")
 KAGGLE_KEY: str = os.environ.get("KAGGLE_KEY", "")
+
+S3_ENDPOINT_URL: str = os.environ.get("S3_ENDPOINT_URL", "")
+S3_ACCESS_KEY: str = os.environ.get("S3_ACCESS_KEY", "")
+S3_SECRET_KEY: str = os.environ.get("S3_SECRET_KEY", "")
+S3_BUCKET: str = os.environ.get("S3_BUCKET", "")

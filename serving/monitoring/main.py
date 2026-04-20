@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,8 @@ MODEL_VERSION_PATH = os.environ.get("MODEL_VERSION_PATH", "/models/current_versi
 
 REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+
+MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow:5000")
 
 # 0 means "we don't know the denominator", so coverage is reported as null
 # rather than an inflated or deflated number.
@@ -158,10 +162,58 @@ def model_health() -> dict[str, Any]:
     }
 
 
+@app.get("/mlflow-health")
+def mlflow_health() -> dict:
+    """Check if the configured MLflow server is reachable.
+
+    Used by operators to verify the monitor↔training integration is live
+    before relying on promote decisions being mirrored to MLflow.
+    """
+    try:
+        resp = urllib.request.urlopen(f"{MLFLOW_TRACKING_URI}/", timeout=2)
+        status = getattr(resp, "status", None) or resp.getcode()
+        # 2xx is the happy path; MLflow occasionally gates the root with
+        # 401/403 behind a proxy — that still proves reachability.
+        if 200 <= status < 300 or status in (401, 403):
+            return {
+                "status": "reachable",
+                "tracking_uri": MLFLOW_TRACKING_URI,
+                "error": None,
+            }
+        return {
+            "status": "unreachable",
+            "tracking_uri": MLFLOW_TRACKING_URI,
+            "error": f"HTTP {status}",
+        }
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return {
+                "status": "reachable",
+                "tracking_uri": MLFLOW_TRACKING_URI,
+                "error": None,
+            }
+        return {
+            "status": "unreachable",
+            "tracking_uri": MLFLOW_TRACKING_URI,
+            "error": str(e),
+        }
+    except Exception as e:
+        return {
+            "status": "unreachable",
+            "tracking_uri": MLFLOW_TRACKING_URI,
+            "error": str(e),
+        }
+
+
 @app.get("/promote-decision")
 def promote_decision() -> dict[str, Any]:
     snap = _compose_metrics()
-    result = evaluate(snap, feedback_store, _now_utc())
+    result = evaluate(
+        snap,
+        feedback_store,
+        _now_utc(),
+        mlflow_tracking_uri=MLFLOW_TRACKING_URI,
+    )
 
     # Persist every decision for audit — even holds — so the SRE review
     # of "why didn't we promote" has a ground-truth trail.
