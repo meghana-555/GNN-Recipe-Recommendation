@@ -5,8 +5,8 @@ echo "=================================================="
 
 # 1. Wait for Mealie API to be healthy
 echo "⏳ Waiting for Mealie Backend to boot sequence..."
-until curl -s http://mealie-frontend:9000/api/app/about > /dev/null; do
-  echo "Still waiting for Mealie (localhost:9000)... sleeping 5s"
+until python -c "import urllib.request; urllib.request.urlopen('http://mealie-frontend:9000/api/app/about', timeout=2)" 2>/dev/null; do
+  echo "Still waiting for Mealie (mealie-frontend:9000)... sleeping 5s"
   sleep 5
 done
 echo "✅ Mealie is online!"
