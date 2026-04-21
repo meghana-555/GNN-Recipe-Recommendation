@@ -741,20 +741,55 @@ def main() -> None:
     # Step 2: Load model checkpoint
     # ------------------------------------------------------------------
     log.info("Loading model checkpoint ...")
-    checkpoint = torch.load(MODEL_PATH, map_location="cpu", weights_only=False)
-    data: HeteroData = checkpoint["data"]
-    num_users: int = checkpoint["num_users"]
-    num_recipes: int = checkpoint["num_recipes"]
-    recipe_feat_dim: int = checkpoint.get(
-        "recipe_feat_dim", data["recipe"].x.shape[1]
-    )
+    raw = torch.load(MODEL_PATH, map_location="cpu", weights_only=False)
+
+    # The self-trained serving checkpoint wraps state_dict + graph metadata in
+    # a dict. The training-pipeline checkpoint (training/train.py) saves the
+    # raw state_dict only. Detect which format we have and rebuild the graph
+    # from CSVs when metadata is absent.
+    if isinstance(raw, dict) and "model_state_dict" in raw:
+        state_dict = raw["model_state_dict"]
+        data: Optional[HeteroData] = raw.get("data")
+        num_users: Optional[int] = raw.get("num_users")
+        num_recipes: Optional[int] = raw.get("num_recipes")
+        recipe_feat_dim: Optional[int] = raw.get("recipe_feat_dim")
+    else:
+        state_dict = raw
+        data = None
+        num_users = None
+        num_recipes = None
+        recipe_feat_dim = None
+
+    if data is None:
+        log.info(
+            "Checkpoint has no bundled graph data — rebuilding from CSVs in %s",
+            DATA_DIR,
+        )
+        recipes_df = pd.read_csv(os.path.join(DATA_DIR, "PP_recipes.csv"))
+        users_df = pd.read_csv(os.path.join(DATA_DIR, "PP_users.csv"))
+        interactions_df, _, _, _ = load_interactions(DATA_DIR)
+        recipe_feat, rebuilt_feat_dim = build_recipe_features(recipes_df)
+        user_feat = build_user_features(users_df)
+        data, rebuilt_num_users, rebuilt_num_recipes = build_graph(
+            recipes_df, users_df, interactions_df, recipe_feat, user_feat
+        )
+        if num_users is None:
+            num_users = rebuilt_num_users
+        if num_recipes is None:
+            num_recipes = rebuilt_num_recipes
+        if recipe_feat_dim is None:
+            recipe_feat_dim = rebuilt_feat_dim
+
+    # Final fallback: derive recipe_feat_dim from the data object if still unset.
+    if recipe_feat_dim is None:
+        recipe_feat_dim = data["recipe"].x.shape[1]
 
     model = Model(
         hidden_channels=HIDDEN_CHANNELS,
         data=data,
         recipe_feat_dim=recipe_feat_dim,
     ).to(DEVICE)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(state_dict)
     model.eval()
     log.info(
         "Model loaded: %d users, %d recipes, recipe_feat_dim=%d",
