@@ -741,54 +741,48 @@ def main() -> None:
     # Step 2: Load model checkpoint
     # ------------------------------------------------------------------
     log.info("Loading model checkpoint ...")
-    raw = torch.load(MODEL_PATH, map_location="cpu", weights_only=False)
+    checkpoint = torch.load(MODEL_PATH, map_location="cpu", weights_only=False)
 
-    # The self-trained serving checkpoint wraps state_dict + graph metadata in
-    # a dict. The training-pipeline checkpoint (training/train.py) saves the
-    # raw state_dict only. Detect which format we have and rebuild the graph
-    # from CSVs when metadata is absent.
-    if isinstance(raw, dict) and "model_state_dict" in raw:
-        state_dict = raw["model_state_dict"]
-        data: Optional[HeteroData] = raw.get("data")
-        num_users: Optional[int] = raw.get("num_users")
-        num_recipes: Optional[int] = raw.get("num_recipes")
-        recipe_feat_dim: Optional[int] = raw.get("recipe_feat_dim")
+    # Detect checkpoint format
+    if isinstance(checkpoint, dict) and "data" in checkpoint:
+        # Old format: full checkpoint with graph data
+        data = checkpoint["data"]
+        num_users = checkpoint["num_users"]
+        num_recipes = checkpoint["num_recipes"]
+        recipe_feat_dim = checkpoint.get("recipe_feat_dim", data["recipe"].x.shape[1])
+        state_dict = checkpoint["model_state_dict"]
     else:
-        state_dict = raw
-        data = None
-        num_users = None
-        num_recipes = None
-        recipe_feat_dim = None
+        # New format: raw state_dict from training/train.py
+        # Derive dimensions from weight shapes
+        state_dict = checkpoint
+        num_users = state_dict["user_emb.weight"].shape[0]
+        num_recipes = state_dict["recipe_emb.weight"].shape[0]
+        recipe_feat_dim = state_dict["recipe_lin.weight"].shape[1]
 
-    if data is None:
-        log.info(
-            "Checkpoint has no bundled graph data — rebuilding from CSVs in %s",
-            DATA_DIR,
-        )
+        # Rebuild graph from CSV files
+        log.info("Raw state_dict detected — rebuilding graph from CSV files")
         recipes_df = pd.read_csv(os.path.join(DATA_DIR, "PP_recipes.csv"))
         users_df = pd.read_csv(os.path.join(DATA_DIR, "PP_users.csv"))
         interactions_df, _, _, _ = load_interactions(DATA_DIR)
-        recipe_feat, rebuilt_feat_dim = build_recipe_features(recipes_df)
+        recipe_feat, recipe_feat_dim_actual = build_recipe_features(recipes_df)
         user_feat = build_user_features(users_df)
-        data, rebuilt_num_users, rebuilt_num_recipes = build_graph(
-            recipes_df, users_df, interactions_df, recipe_feat, user_feat
-        )
-        if num_users is None:
-            num_users = rebuilt_num_users
-        if num_recipes is None:
-            num_recipes = rebuilt_num_recipes
-        if recipe_feat_dim is None:
-            recipe_feat_dim = rebuilt_feat_dim
+        data, _, _ = build_graph(recipes_df, users_df, interactions_df, recipe_feat, user_feat)
 
-    # Final fallback: derive recipe_feat_dim from the data object if still unset.
-    if recipe_feat_dim is None:
-        recipe_feat_dim = data["recipe"].x.shape[1]
+        # Pad features if checkpoint dimensions differ from CSV dimensions
+        if recipe_feat.shape[0] < num_recipes:
+            pad = torch.zeros(num_recipes - recipe_feat.shape[0], recipe_feat.shape[1])
+            recipe_feat = torch.cat([recipe_feat, pad], dim=0)
+            data["recipe"].x = recipe_feat
+        if user_feat.shape[0] < num_users:
+            pad = torch.zeros(num_users - user_feat.shape[0], user_feat.shape[1])
+            user_feat = torch.cat([user_feat, pad], dim=0)
+            data["user"].x = user_feat
 
-    model = Model(
-        hidden_channels=HIDDEN_CHANNELS,
-        data=data,
-        recipe_feat_dim=recipe_feat_dim,
-    ).to(DEVICE)
+        # Update node IDs to match checkpoint dimensions
+        data["user"].node_id = torch.arange(num_users)
+        data["recipe"].node_id = torch.arange(num_recipes)
+
+    model = Model(hidden_channels=HIDDEN_CHANNELS, data=data, recipe_feat_dim=recipe_feat_dim).to(DEVICE)
     model.load_state_dict(state_dict)
     model.eval()
     log.info(
