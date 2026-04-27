@@ -345,12 +345,14 @@ def run_personalized_recommendations(s3, registry):
         if not match.empty:
             user_int = int(match.iloc[0]['ml_native_id'])
         else:
-            # Cold-start: hash UUID to pick a diverse Kaggle proxy user
-            user_int = hash(uid) % min(num_users_checkpoint, 25076)
+            # Cold-start: use UUID's deterministic int for diverse proxy node
+            import uuid as _uuid
+            user_int = _uuid.UUID(uid).int % min(num_users_checkpoint, 25076)
         
         if user_int >= num_users_checkpoint:
-            # Exceeds model capacity: hash to a valid diverse node
-            user_int = hash(uid) % min(num_users_checkpoint, 25076)
+            # Exceeds model capacity: deterministic fallback
+            import uuid as _uuid
+            user_int = _uuid.UUID(uid).int % min(num_users_checkpoint, 25076)
         
         # Score all recipes for this user
         user_emb = x_dict["user"][user_int].unsqueeze(0)

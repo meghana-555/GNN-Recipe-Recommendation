@@ -386,13 +386,15 @@ def all_recommendations():
             if not match.empty:
                 user_int = int(match.iloc[0]['ml_native_id'])
                 recs = recommend_for_user(user_int, top_k=7)
-                # If mapped node exceeds model capacity, use hash fallback
+                # If mapped node exceeds model capacity, use deterministic fallback
                 if not recs:
-                    fallback_int = hash(uid) % min(cache['nu'], 25076)
+                    import uuid as _uuid
+                    fallback_int = _uuid.UUID(uid).int % min(cache['nu'], 25076)
                     recs = recommend_for_user(fallback_int, top_k=7)
             else:
-                # Cold-start: hash UUID to diverse Kaggle proxy user
-                fallback_int = hash(uid) % min(cache['nu'], 25076)
+                # Cold-start: use UUID's deterministic int for diverse proxy node
+                import uuid as _uuid
+                fallback_int = _uuid.UUID(uid).int % min(cache['nu'], 25076)
                 recs = recommend_for_user(fallback_int, top_k=7)
 
             results.append({
