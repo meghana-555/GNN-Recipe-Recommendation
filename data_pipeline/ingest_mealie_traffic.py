@@ -68,17 +68,75 @@ def get_dynamic_max_id(s3, entity_type):
 def extract_mealie_data():
     print("--- 2. Connecting to PostgreSQL Mealie Replica ---")
     connection_string = os.getenv("POSTGRES_URL", f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}")
+    
+    frames = []
+    
     try:
         engine = create_engine(connection_string)
-        # Query exactly the "users_to_recipes" table to get incremental ratings.
-        df_traffic = pd.read_sql("SELECT user_id AS mealie_user_uuid, recipe_id AS mealie_recipe_uuid, rating, created_at AS date FROM users_to_recipes WHERE rating IS NOT NULL", engine)
         
+        # Signal 1: Explicit ratings from users_to_recipes (strongest signal)
+        try:
+            df_ratings = pd.read_sql(
+                "SELECT user_id AS mealie_user_uuid, recipe_id AS mealie_recipe_uuid, "
+                "rating, created_at AS date FROM users_to_recipes WHERE rating IS NOT NULL",
+                engine
+            )
+            df_ratings['signal_source'] = 'rating'
+            frames.append(df_ratings)
+            print(f"  📊 Ratings: {len(df_ratings)} records")
+        except Exception as e:
+            print(f"  ⚠️ Ratings query skipped: {e}")
+        
+        # Signal 2: Favorites → implicit rating of 4.5 (from same table, is_favorite flag)
+        try:
+            df_favs = pd.read_sql(
+                "SELECT user_id AS mealie_user_uuid, recipe_id AS mealie_recipe_uuid, "
+                "created_at AS date FROM users_to_recipes WHERE is_favorite = true",
+                engine
+            )
+            df_favs['rating'] = 4.5  # Favorite = strong positive implicit signal
+            df_favs['signal_source'] = 'favorite'
+            frames.append(df_favs)
+            print(f"  ❤️ Favorites: {len(df_favs)} records")
+        except Exception as e:
+            print(f"  ⚠️ Favorites query skipped: {e}")
+        
+        # Signal 3: Meal plans → implicit rating of 4.0
+        try:
+            df_meals = pd.read_sql(
+                "SELECT user_id AS mealie_user_uuid, recipe_id AS mealie_recipe_uuid, "
+                "created_at AS date FROM group_meal_plans "
+                "WHERE recipe_id IS NOT NULL",
+                engine
+            )
+            df_meals['rating'] = 4.0  # Meal plan = moderate positive signal
+            df_meals['signal_source'] = 'mealplan'
+            frames.append(df_meals)
+            print(f"  🍽️ Meal plans: {len(df_meals)} records")
+        except Exception as e:
+            print(f"  ⚠️ Mealplans query skipped: {e}")
+        
+    except Exception as e:
+        print(f"Mealie Postgres Exception: {e}")
+    
+    if frames:
+        df_traffic = pd.concat(frames, ignore_index=True)
         # Enforce string primitive conversion on python UUID objects for PyArrow compatibility
         df_traffic['mealie_user_uuid'] = df_traffic['mealie_user_uuid'].astype(str)
         df_traffic['mealie_recipe_uuid'] = df_traffic['mealie_recipe_uuid'].astype(str)
-    except Exception as e:
-        print(f"Mealie Postgres Exception: {e}")
-        df_traffic = pd.DataFrame(columns=["mealie_user_uuid", "mealie_recipe_uuid", "rating", "date"])
+        print(f"  ✅ Total combined signals: {len(df_traffic)} records")
+    else:
+        df_traffic = pd.DataFrame(columns=["mealie_user_uuid", "mealie_recipe_uuid", "rating", "date", "signal_source"])
+    
+    # Deduplicate: if same user rated + favorited + meal-planned the same recipe,
+    # keep only the strongest signal (highest rating equivalent)
+    if not df_traffic.empty:
+        before = len(df_traffic)
+        df_traffic = df_traffic.sort_values('rating', ascending=False)
+        df_traffic = df_traffic.drop_duplicates(subset=['mealie_user_uuid', 'mealie_recipe_uuid'], keep='first')
+        after = len(df_traffic)
+        if before != after:
+            print(f"  🔄 Deduplicated: {before} → {after} unique (user, recipe) pairs")
         
     return df_traffic
 

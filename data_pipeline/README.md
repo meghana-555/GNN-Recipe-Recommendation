@@ -3,90 +3,115 @@
 This repository contains the Data Integration system for linking Mealie to an offline Graph Neural Network (GraphSAGE) recommendation system.
 
 ## 1. Components & Automated Workflow
-The data components are built to be robust, fully dockerized, and automated via standard Docker Compose workflows.
-- `ingest_baseline.py`: Fetches the raw `food-com-recipes-and-user-interactions` from Kaggle, applies ingestion evaluation checks, formatting logic, handles <5GB synthetic expansion, and writes to Chameleon Object Store as our **Historical Baseline**.
-- `ingest_mealie_traffic.py` (Traffic Poller): Connects directly to the live PostgreSQL Mealie Database to sync real human usage. Automatically translates Mealie UUIDs to ML sequential Integers via our S3 Registry State Machine, and pushes to `production_traffic/`.
-- `batch_pipeline.py`: Offline sync. Merges baseline and exact production traffic data, mathematically verifies split logic to prevent data leakage across train and eval sets, validates distribution qualities, and stages the splits for the Training member.
-- `online_features.py` : Invoked real-time by the Serving layer to gather metrics representing user contexts in production.
 
-*(Note: `generator.py` is safely preserved strictly as a legacy emulator script.)*
+All components are fully dockerized and orchestrated via a single `docker compose up --build -d`.
 
-## 2. Schema Alignment & S3 ID Translation Registry
+| Script | Purpose |
+|--------|---------|
+| `ingest_baseline.py` | Fetches Kaggle `food-com` dataset, validates schema, expands with synthetic data generation (popularity-weighted new interactions, no data leakage), uploads to S3 |
+| `seed_mealie_recipes.py` | Seeds Mealie with real recipes from the Kaggle dataset |
+| `generator.py` | Simulates 5 user personas with distinct behavior profiles (ratings, favorites, meal plans) via Mealie's per-user API endpoints |
+| `ingest_mealie_traffic.py` | Polls PostgreSQL for user interactions (ratings + favorites + meal plans), maps Mealie UUIDs to ML integer IDs via S3 Registry |
+| `batch_pipeline.py` | Merges baseline + production traffic, applies temporal splits to prevent data leakage, stages versioned datasets for Training |
+| `serve_recommendations.py` | Runs GNN inference per-user and injects personalized `🤖 For {username}` tags into Mealie's database |
+| `dashboard.py` | Streamlit dashboard showing per-user recommendations with normalized confidence scores and live interaction counts |
+| `online_features.py` | Real-time feature computation for the Serving layer |
+| `orchestrator.sh` | Daemon loop: runs ingest → batch → retrain trigger → tag refresh every 5 minutes |
 
-To seamlessly synchronize Kaggle's pure integer schemas with Mealie's UUID-heavy application schema and the strict Inference API protocol:
-- Datasets convert `user_id` to prefixed string format (`"user:38094"`).
-- Our Traffic Poller retrieves a global state map `id_mapping_registry.parquet` from S3. New Mealie interactions are cross-referenced, retaining memory of Old Kaggle items while safely mutating brand new interaction UUIDs into strictly typed ML Integer ID representations.
+## 2. User Simulation (5 Personas)
+
+The traffic generator creates 5 diverse user personas via Mealie's invitation token flow:
+
+| Persona | Behavior | Activity |
+|---------|----------|----------|
+| Comfort Food Lover | Rates high (4-5), prefers comfort food | High |
+| Health Nut | Strict rater (2-3), prefers healthy recipes | Medium |
+| Adventurous Eater | Tries everything, no preference filter | Very high |
+| Casual Browser | Rates around 3-4, prefers simple recipes | Low |
+| Weekend Warrior | Plans meals heavily, mostly positive ratings | Low base, weekend spikes |
+
+Interactions use correct per-user Mealie APIs:
+- `POST /api/users/{id}/ratings/{slug}` — records ratings to `users_to_recipes`
+- `POST /api/users/{id}/favorites/{slug}` — records favorites to `users_to_recipes`
+- `POST /api/households/mealplans` — records meal plans to `group_meal_plans`
+
+## 3. Synthetic Data Expansion
+
+For datasets < 5GB, `ingest_baseline.py` expands data following best practices:
+1. **Popularity-weighted sampling**: Users and recipes sampled proportional to activity
+2. **Unique pairs only**: Skips any (user, recipe) pair that already exists
+3. **Gaussian noise on ratings**: Blends user mean + recipe mean + N(0, 0.8)
+4. **No data leakage**: Synthetic dates stay within the original data range
+
+## 4. Schema Alignment & S3 ID Translation Registry
+
+Seamlessly synchronizes Kaggle integer IDs with Mealie UUIDs:
+- `id_mapping_registry.parquet` on S3 maintains the global state map
+- New Mealie interactions are cross-referenced and assigned sequential ML integer IDs
+- Cold-start users are hash-distributed across existing Kaggle user nodes for diverse recommendations
 
 ### Data Flow Diagram
 
 ```mermaid
 flowchart TD
-    subgraph DevOps App Boundary
-        Postgres[(PostgreSQL\nInstance)]
+    subgraph Mealie Application
+        Postgres[(PostgreSQL)]
         MealieApp[Mealie Web UI]
         MealieApp <--> Postgres
     end
 
-    subgraph Data Boundaries
-        Kaggle["Kaggle (food-com)"]
+    subgraph Data Pipeline
         Ingest["ingest_baseline.py"]
+        Generator["generator.py (5 personas)"]
         Poller["ingest_mealie_traffic.py"]
         Batch["batch_pipeline.py"]
-        S3Reg[("S3: /dataset/registry/")]
-        S3Base[("S3: /historical_baseline/")]
-        S3Traffic[("S3: /production_traffic/")]
-    end
-    
-    subgraph S3 Output
-        S3Train[("S3: /train/")]
-        S3Eval[("S3: /evaluation/")]
+        Serve["serve_recommendations.py"]
+        Dashboard["dashboard.py (Streamlit)"]
     end
 
-    Kaggle --> Ingest
-    Ingest --> S3Base
+    subgraph S3 Object Storage
+        S3Reg[("registry/")]
+        S3Base[("historical_baseline/")]
+        S3Traffic[("production_traffic/")]
+        S3Train[("train/")]
+    end
+
+    Kaggle["Kaggle (food-com)"] --> Ingest --> S3Base
+    Generator --> Postgres
     Postgres --> Poller
     Poller <--> S3Reg
     Poller --> S3Traffic
     S3Base --> Batch
     S3Traffic --> Batch
-    Batch == "Split strictly by Time" ==> S3Train
-    Batch == "Split strictly by Time" ==> S3Eval
+    Batch == "Temporal Split" ==> S3Train
+    S3Train --> Serve --> Postgres
+    S3Train --> Dashboard
 ```
 
-## 3. Data Versioning
+## 5. Personalized Recommendations
 
-Our Chameleon object storage (`ObjStore_proj14`) applies versioning folders structurally:
-- Baseline: Immutable at `dataset/historical_baseline/RAW_interactions.parquet`
-- Traffic: `production_traffic/YYYYMMDD_HHMM/batch.parquet`
-- Offline Target: `train/YYYYMMDD_HHMM/train.parquet`
+Two surfaces display per-user GNN recommendations:
+- **Mealie UI**: Each user gets a `🤖 For {name}` tag containing their top 7 recommended recipes
+- **Streamlit Dashboard** (port 8501): Shows all users with interaction counts, recipe names, and 0-100% confidence scores
 
-## 4. Evaluation and Monitoring Strategy
-1. **At Ingestion**: Real-time evaluation detecting missing core columns (`user_id`, `recipe_id`, `rating`) or unapproved scale ranges.
-2. **Prior to Model Release**: Evaluates `Candidate Quality` by auditing node sparsity prior to split upload, and asserts absolute isolation between training and evaluation dataset timestamps (Leakage Prevention).
-3. **Inference Metrics Logging**: Caches queries generated by `online_features.py` back into `monitoring/` bucket on S3 to assess Data Drift and average input properties.
+Both surfaces refresh every daemon cycle (5 min for tags, 30 min model TTL for dashboard).
 
-## 5. Execution Tutorial (Chameleon VM Quickstart)
+## 6. Automation & Retrain Trigger
 
-If you have just launched a fresh Chameleon Ubuntu VM, follow these exact steps to launch the entire Mealie app, PostgreSQL, baseline ingestion, and the periodic scheduling queues **all dynamically integrated**.
+The daemon loop (`orchestrator.sh`) runs continuously:
+1. Polls Mealie for new interactions (every 5 min)
+2. Compiles versioned training batches to S3 (every 5 min)
+3. Creates `retrain_trigger_*.json` on S3 (every 12 hours) for the Training Node
+4. Refreshes Mealie AI tags with latest per-user recommendations (every 5 min)
 
-### Step 1: Configure Credentials
-```bash
-# Setup AWS/Object Store credentials in a .env file
-cp .env.template .env
-# Edit the .env to insert your S3 keys:
-nano .env 
-```
-
-### Step 2: One-Command Execution!
-We have fully automated the entire microservice lifecycle (Web UI, Data DB, Baseline Scripts, Poller, and Batch pipeline) via Docker Compose. Run this single command from within the `data_pipeline/` directory:
+## 7. Execution
 
 ```bash
+cd data_pipeline
+cp .env.example .env   # edit with real credentials
 docker compose up --build -d
 ```
 
-### What happens now?
-- **Port 9000** on your Chameleon VM will now correctly serve your real live Mealie Application.
-- **Port 5432** serves the persistent Postgres database locally.
-- A background `ingest` container immediately runs to grab the baseline from Kaggle and deposits it to S3, then peacefully exits.
-- A background `traffic-poller` wakes up and constantly crawls PostgreSQL for updates, translating UUIDs.
-- A background `batch` processor runs fully automated cycles every 1 hour to output splits.
+- **Port 9000**: Mealie UI
+- **Port 8501**: Recommendation Dashboard
+- **Port 5432**: PostgreSQL

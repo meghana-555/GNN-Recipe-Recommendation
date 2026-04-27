@@ -12,7 +12,7 @@ services:
     volumes:
       - mealie-db-data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "5433:5432"
 
   mealie:
     image: ghcr.io/mealie-recipes/mealie:latest
@@ -49,6 +49,20 @@ services:
     volumes:
       - ./local_data:/app/local_data
       - ./serve_recommendations.py:/app/serve_recommendations.py
+
+  recommendation-dashboard:
+    build: .
+    image: mealie-data
+    container_name: recommendation-dashboard
+    depends_on:
+      - data-pipeline
+    env_file:
+      - .env
+    command: ["python", "dashboard.py"]
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./local_data:/app/local_data
 
 volumes:
   mealie-db-data:

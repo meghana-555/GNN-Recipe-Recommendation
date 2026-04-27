@@ -32,6 +32,11 @@ def load_kaggle_recipes():
     print("Loading Local Kaggle CSVs...")
     df_raw = pd.read_csv("local_data/RAW_recipes.csv")
     df_pp = pd.read_csv("local_data/PP_recipes.csv")
+    # Normalize id types: RAW may have "recipe:" prefix from processing
+    if df_raw['id'].dtype == object and df_raw['id'].str.startswith('recipe:').any():
+        df_raw['id'] = df_raw['id'].str.replace('recipe:', '', regex=False).astype(int)
+    df_raw['id'] = df_raw['id'].astype(int)
+    df_pp['id'] = df_pp['id'].astype(int)
     # Join on Kaggle ID to align metadata with contiguous index `i`
     df_merged = pd.merge(df_raw, df_pp[['id', 'i']], on='id', how='inner')
     

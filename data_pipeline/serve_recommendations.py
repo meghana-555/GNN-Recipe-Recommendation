@@ -122,13 +122,20 @@ def execute_gnn_inference(s3, registry_df, num_recipes=7):
     recipe_registry = registry_df[registry_df['entity_type'] == 'recipe']
     user_registry = registry_df[registry_df['entity_type'] == 'user']
     
-    if recipe_registry.empty or user_registry.empty:
-        print("Registry empty. Missing fundamental nodes.")
+    if recipe_registry.empty:
+        print("Registry empty. No recipes mapped.")
         return [], None
-        
-    target_user_int = int(user_registry['ml_native_id'].max())
-    target_user_uuid = user_registry[user_registry['ml_native_id'] == target_user_int]['mealie_uuid'].iloc[0]
-    print(f"Locked Target Inference Identity: [User Node {target_user_int}]")
+    
+    if user_registry.empty:
+        # Cold-start fallback: no Mealie users have interacted yet.
+        # Use a default Kaggle baseline user for initial global recommendations.
+        target_user_int = 0
+        target_user_uuid = None
+        print(f"No Mealie users in registry. Falling back to Kaggle User Node {target_user_int} for global recommendations.")
+    else:
+        target_user_int = int(user_registry['ml_native_id'].max())
+        target_user_uuid = user_registry[user_registry['ml_native_id'] == target_user_int]['mealie_uuid'].iloc[0]
+        print(f"Locked Target Inference Identity: [User Node {target_user_int}]")
     
     # 1. Load Parquets
     data_path = "/app/local_data" if os.path.exists('/.dockerenv') else "local_data"
@@ -216,53 +223,161 @@ def map_predictions_to_uuid(registry_df, predicted_ints):
     return mapped_uuids
 
 
-def inject_tags_via_database(recipe_uuids):
-    print("--- 4. Direct Database Tag Injection (Bypassing API Constraints) ---")
-    tag_name = "🤖 AI Recommended"
+def inject_tags_via_database(per_user_recs):
+    """Inject one AI tag per user, each containing their 7 recommended recipes.
+    
+    per_user_recs: list of dicts with keys: display_name, recipe_slugs (ordered by rank)
+    """
+    print("--- 4. Direct Database Tag Injection (Per-User Personalized) ---")
     try:
         engine = create_engine(MEALIE_POSTGRES_URL)
         with engine.begin() as conn:
-            # Clear old recommendations for idempotency in DB injections
-            tag_query = text("SELECT id FROM tags WHERE name = :name LIMIT 1")
-            result = conn.execute(tag_query, {"name": tag_name}).fetchone()
-            if not result:
-                # Dynamic Backfill of missing Master Element
+            # Get group ID for tag creation
+            group_id = conn.execute(text("SELECT id FROM groups LIMIT 1")).fetchone()[0]
+            
+            # Clean up ALL old AI recommendation tags (idempotent)
+            old_tags = conn.execute(text(
+                "SELECT id FROM tags WHERE name LIKE :pattern"
+            ), {"pattern": "🤖%"}).fetchall()
+            for tag_row in old_tags:
+                conn.execute(text("DELETE FROM recipes_to_tags WHERE tag_id = :tid"),
+                           {"tid": tag_row[0]})
+                conn.execute(text("DELETE FROM tags WHERE id = :tid"),
+                           {"tid": tag_row[0]})
+            
+            total_injected = 0
+            for user_rec in per_user_recs:
+                display_name = user_rec['display_name']
+                slugs = user_rec['recipe_slugs']
+                
+                # One tag per user
                 import uuid
+                tag_name = f"🤖 For {display_name}"
+                tag_slug = f"ai-for-{display_name.lower().replace(' ','-')}"
+                tag_id = str(uuid.uuid4())
+                conn.execute(text(
+                    "INSERT INTO tags (id, name, slug, group_id) "
+                    "VALUES (:id, :name, :slug, :gid)"
+                ), {"id": tag_id, "name": tag_name, "slug": tag_slug, "gid": group_id})
                 
-                # Extract tenant Group ID to satisfy Mealie strict relational rules
-                group_query = text("SELECT id FROM groups LIMIT 1")
-                group_id = conn.execute(group_query).fetchone()[0]
-                
-                new_tag_id = str(uuid.uuid4())
-                insert_tag = text("INSERT INTO tags (id, name, slug, group_id) VALUES (:id, :name, :slug, :group_id)")
-                conn.execute(insert_tag, {"id": new_tag_id, "name": tag_name, "slug": "ai-recommended", "group_id": group_id})
-                tag_id = new_tag_id
-                print(f"✨ Forged missing Master Tag: [{tag_name}] -> {tag_id}")
-            else:
-                tag_id = result[0]
+                # Associate all 7 recommended recipes to this one tag
+                for slug in slugs:
+                    recipe_row = conn.execute(text(
+                        "SELECT id FROM recipes WHERE slug = :slug OR id::text = :slug LIMIT 1"
+                    ), {"slug": str(slug)}).fetchone()
+                    
+                    if recipe_row:
+                        conn.execute(text(
+                            "INSERT INTO recipes_to_tags (recipe_id, tag_id) "
+                            "VALUES (:rid, :tid) ON CONFLICT DO NOTHING"
+                        ), {"rid": recipe_row[0], "tid": tag_id})
+                        total_injected += 1
             
-            # Optional cleanup: Wipe the AI Recommendations cleanly before updating the new predicted set
-            cleanup_query = text("DELETE FROM recipes_to_tags WHERE tag_id = :tag_id")
-            conn.execute(cleanup_query, {"tag_id": tag_id})
-            
-            success_count = 0
-            for r_slug in recipe_uuids:
-                resolver_query = text("SELECT id FROM recipes WHERE slug = :slug OR id::text = :slug LIMIT 1")
-                recipe_row = conn.execute(resolver_query, {"slug": str(r_slug)}).fetchone()
-                if not recipe_row: continue
-                db_recipe_uuid = recipe_row[0]
-                
-                query = text("""
-                    INSERT INTO recipes_to_tags (recipe_id, tag_id)
-                    VALUES (:recipe_id, :tag_id)
-                    ON CONFLICT DO NOTHING
-                """)
-                conn.execute(query, {"recipe_id": db_recipe_uuid, "tag_id": str(tag_id)})
-                success_count += 1
-                
-        print(f"🎉 OPERATION COMPLETE: Successfully injected {success_count} True ML recipes into AI Recommendations!")
+            print(f"🎉 Injected {total_injected} recipes across {len(per_user_recs)} user tags!")
     except Exception as e:
-        print(f"\n❌ Database Connection Failed: {e}")
+        print(f"\n❌ Database Tag Injection Failed: {e}")
+
+
+def run_personalized_recommendations(s3, registry):
+    """Run GNN inference for ALL Mealie users and create per-user tags."""
+    recipe_registry = registry[registry['entity_type'] == 'recipe']
+    user_registry = registry[registry['entity_type'] == 'user']
+    
+    if recipe_registry.empty:
+        print("Registry empty. No recipes mapped.")
+        return
+    
+    # Load model once
+    data_path = "/app/local_data" if os.path.exists('/.dockerenv') else "local_data"
+    recipes_df = pd.read_csv(f"{data_path}/PP_recipes.csv")
+    users_df = pd.read_csv(f"{data_path}/PP_users.csv")
+    recipe_feat, user_feat, recipe_feat_dim = build_features(recipes_df, users_df)
+    
+    print("Downloading neural weights (best_model.pt) from S3...")
+    device = torch.device('cpu')
+    model_path = "/tmp/best_model.pt"
+    s3.download_file(BUCKET_NAME, "training/best_model.pt", model_path)
+    state_dict = torch.load(model_path, map_location=device)
+    
+    num_users_checkpoint = state_dict['user_emb.weight'].shape[0]
+    num_recipes_checkpoint = state_dict['recipe_emb.weight'].shape[0]
+    print(f"Aligning Graph Tensors to strict Model Checkpoint boundaries (U: {num_users_checkpoint}, R: {num_recipes_checkpoint})...")
+    
+    if recipe_feat.shape[0] < num_recipes_checkpoint:
+        pad = num_recipes_checkpoint - recipe_feat.shape[0]
+        recipe_feat = torch.cat([recipe_feat, torch.zeros(pad, recipe_feat.shape[1])], dim=0)
+    if user_feat.shape[0] < num_users_checkpoint:
+        pad = num_users_checkpoint - user_feat.shape[0]
+        user_feat = torch.cat([user_feat, torch.zeros(pad, user_feat.shape[1])], dim=0)
+    
+    data = HeteroData()
+    data["user"].node_id = torch.arange(num_users_checkpoint)
+    data["recipe"].node_id = torch.arange(num_recipes_checkpoint)
+    data["recipe"].x = recipe_feat
+    data["user"].x = user_feat
+    data["user", "rates", "recipe"].edge_index = torch.empty((2, 0), dtype=torch.long)
+    data = T.ToUndirected()(data)
+    
+    model = Model(hidden_channels=64, recipe_feat_dim=recipe_feat_dim, data=data).to(device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    
+    print("Executing Neural Forward Pass Cartesian product...")
+    with torch.no_grad():
+        x_dict = model(data.to(device))
+    
+    valid_ints = recipe_registry['ml_native_id'].tolist()
+    
+    # Get all Mealie users from PostgreSQL
+    engine = create_engine(MEALIE_POSTGRES_URL)
+    with engine.connect() as conn:
+        mealie_users = conn.execute(text(
+            "SELECT id, full_name, username FROM users ORDER BY created_at"
+        )).fetchall()
+    
+    per_user_recs = []
+    for user_row in mealie_users:
+        uid, full_name, username = str(user_row[0]), user_row[1], user_row[2]
+        display_name = full_name or username or uid[:8]
+        
+        # Find GNN node for this user
+        match = user_registry[user_registry['mealie_uuid'] == uid]
+        if not match.empty:
+            user_int = int(match.iloc[0]['ml_native_id'])
+        else:
+            # Cold-start: hash UUID to pick a diverse Kaggle proxy user
+            user_int = hash(uid) % min(num_users_checkpoint, 25076)
+        
+        if user_int >= num_users_checkpoint:
+            # Exceeds model capacity: hash to a valid diverse node
+            user_int = hash(uid) % min(num_users_checkpoint, 25076)
+        
+        # Score all recipes for this user
+        user_emb = x_dict["user"][user_int].unsqueeze(0)
+        scores = (user_emb * x_dict["recipe"]).sum(dim=-1)
+        mask = torch.ones_like(scores, dtype=torch.bool)
+        for vi in valid_ints:
+            if vi < len(mask):
+                mask[vi] = False
+        scores[mask] = -float('inf')
+        top_scores, top_idx = torch.topk(scores, k=min(7, len(valid_ints)))
+        
+        # Map ML ints back to Mealie slugs
+        recipe_slugs = []
+        for idx in top_idx.tolist():
+            rmatch = recipe_registry[recipe_registry['ml_native_id'] == idx]
+            if not rmatch.empty:
+                recipe_slugs.append(rmatch.iloc[0]['mealie_uuid'])
+        
+        per_user_recs.append({
+            'display_name': display_name,
+            'recipe_slugs': recipe_slugs
+        })
+        print(f"  🧠 {display_name}: {len(recipe_slugs)} recommendations (node={user_int})")
+    
+    # Inject tags
+    if per_user_recs:
+        inject_tags_via_database(per_user_recs)
 
 
 if __name__ == "__main__":
@@ -275,7 +390,5 @@ if __name__ == "__main__":
     except Exception as e:
         pass
         
-    predicted_ints, target_user_uuid = execute_gnn_inference(s3, registry, num_recipes=7)
-    if predicted_ints:
-        predicted_uuids = map_predictions_to_uuid(registry, predicted_ints)
-        inject_tags_via_database(predicted_uuids)
+    run_personalized_recommendations(s3, registry)
+

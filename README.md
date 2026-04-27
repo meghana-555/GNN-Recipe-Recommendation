@@ -26,7 +26,8 @@ docker compose --profile tools run --rm rollback     # manual rollback
 |---|---|---|---|
 | postgres | 5432 | data_pipeline | Mealie backend DB |
 | mealie | 9000 | data_pipeline | Mealie UI + API |
-| data-pipeline | — | data_pipeline | Ingest + seed + traffic poller |
+| data-pipeline | — | data_pipeline | Ingest + seed + traffic generator + per-user tag injection |
+| dashboard | 8501 | data_pipeline | Streamlit recommendation dashboard (per-user) |
 | mlflow | 5000 | training | Experiment tracking + model registry |
 | training | — | training | Training job (profile: training) |
 | feedback-capture | — | training | Pulls Mealie ratings into training data |
@@ -64,14 +65,16 @@ Standalone mode uses each sub-compose's own network name (`mealie-ml-network` vi
 
 ## Feedback loop (end-to-end)
 
-1. User rates a recipe in Mealie UI (localhost:9000).
-2. `data_pipeline/ingest_mealie_traffic.py` polls Mealie's Postgres and writes events to object storage.
-3. `training/feedback-capture` pulls the events into training data.
-4. `training/retrain-orchestrator` detects the trigger, runs a new training job.
-5. MLflow registry gets the new version, promote/rollback decision is made.
-6. `serving/batch` re-scores users into Redis.
-7. `serving/api` serves the new recs at localhost:8000.
-8. `serving/monitor` observes request latency + user feedback and posts decisions to MLflow.
+1. Users interact with recipes in Mealie UI (localhost:9000) — ratings, favorites, and meal plans.
+2. `data_pipeline/generator.py` simulates 5 user personas with distinct behavior profiles.
+3. `data_pipeline/ingest_mealie_traffic.py` polls Mealie's Postgres for all three signal types and writes to S3.
+4. `data_pipeline/batch_pipeline.py` compiles versioned training data with temporal splits (no leakage).
+5. Every 12 hours, a `retrain_trigger_*.json` is automatically created on S3.
+6. `training/retrain-orchestrator` detects the trigger, runs a new training job.
+7. MLflow registry gets the new version, promote/rollback decision is made.
+8. `data_pipeline/serve_recommendations.py` refreshes per-user `🤖 For {name}` tags in Mealie.
+9. `data_pipeline/dashboard.py` auto-reloads the model (30-min TTL) and displays per-user recommendations at localhost:8501.
+10. `serving/api` serves the new recs at localhost:8000.
 
 ## Rollback paths
 
@@ -80,10 +83,9 @@ See `serving/README.md` → "Rollback paths" for the file-swap vs. MLflow-regist
 ## Directory map
 
 ```
-data_pipeline/    Junhao — Mealie + Postgres + ingestion
+data_pipeline/    Junhao — Mealie + Postgres + ingestion + traffic simulation + dashboard
 training/         Meghana — GNN training + MLflow + monitoring
 serving/          Zayed — FastAPI + Redis + decisions
 docker-compose.yml   root orchestrator (this file's sibling)
 .env.example      consolidated env vars
-ROOT_README.md    this file
 ```

@@ -36,7 +36,31 @@ def check_s3_already_exists():
     try:
         s3.head_object(Bucket=BUCKET_NAME, Key="dataset/historical_baseline/RAW_interactions.csv")
         s3.head_object(Bucket=BUCKET_NAME, Key="dataset/historical_baseline/PP_recipes.csv")
-        print("✅ Full Baseline already exists on S3. Skipping ingestion.")
+        print("✅ Full Baseline already exists on S3.")
+        
+        # Critical: verify local files also exist. If not, pull from S3.
+        local_files = [
+            "RAW_interactions.csv", "RAW_recipes.csv",
+            "PP_recipes.csv", "PP_users.csv",
+            "interactions_train.csv", "interactions_validation.csv", "interactions_test.csv"
+        ]
+        os.makedirs("local_data", exist_ok=True)
+        missing = [f for f in local_files if not os.path.exists(f"local_data/{f}")]
+        
+        if missing:
+            print(f"⚠️ Local files missing ({len(missing)} files). Downloading from S3...")
+            for f in missing:
+                s3_key = f"dataset/historical_baseline/{f}"
+                local_path = f"local_data/{f}"
+                try:
+                    s3.download_file(BUCKET_NAME, s3_key, local_path)
+                    print(f"  ✅ Downloaded {f}")
+                except Exception as e:
+                    print(f"  ⚠️ Could not download {f}: {e}")
+            print("✅ Local files synced from S3.")
+        else:
+            print("✅ Local files also present. Skipping ingestion.")
+        
         sys.exit(0)
     except botocore.exceptions.ClientError as e:
         if e.response['Error']['Code'] == "404":
@@ -86,20 +110,78 @@ def evaluate_and_format(dest_path):
     assert df['rating'].between(0, 5).all(), "Found ratings outside 0-5 range"
     assert not df[required_cols].isnull().any().any(), "Found NULL values in critical columns"
     
-    # Expansion Logic: If < 5GB, duplicate to meet project synthetic expansion rule
-    # Food.com is ~500MB
+    # Expansion Logic: If < 5GB, expand following best practices for synthetic data
+    # Food.com dataset is ~500MB raw. Course requires expansion if < 5GB.
+    # Strategy: Generate plausible NEW interactions (not duplicate existing ones)
+    #   1. Sample users and recipes proportional to their activity/popularity
+    #   2. Generate new (user, recipe) pairs that DON'T already exist
+    #   3. Assign ratings with Gaussian noise around user/recipe means
+    #   4. Assign dates within the original date range (no future leakage)
     original_len = len(df)
-    if original_len < 5_000_000:  
-        print("Dataset is small. Synthetically expanding data...")
-        # Since we use temporal splits, we just copy data and shift dates slightly as an expansion mechanism
-        synth_df = df.sample(frac=0.5, replace=True).copy()
+    if original_len < 5_000_000:
+        print("Dataset is small. Expanding with synthetic data generation...")
+        target_rows = int(original_len * 0.5)  # Add 50% more rows
+        
+        # Pre-compute statistics for realistic generation
+        user_mean_rating = df.groupby('user_id')['rating'].mean().to_dict()
+        recipe_mean_rating = df.groupby('recipe_id')['rating'].mean().to_dict()
+        user_counts = df['user_id'].value_counts()
+        recipe_counts = df['recipe_id'].value_counts()
+        
+        # Unique users and recipes with popularity weights
+        users = user_counts.index.tolist()
+        user_weights = (user_counts.values / user_counts.values.sum()).tolist()
+        recipes = recipe_counts.index.tolist()
+        recipe_weights = (recipe_counts.values / recipe_counts.values.sum()).tolist()
+        
+        # Build set of existing (user, recipe) pairs to avoid duplicates
+        existing_pairs = set(zip(df['user_id'], df['recipe_id']))
+        
+        # Date range for synthetic entries (stay within original range, no future leak)
         try:
-            synth_df['date'] = pd.to_datetime(synth_df['date']) + pd.Timedelta(days=365)
-            synth_df['date'] = synth_df['date'].astype(str)
+            dates = pd.to_datetime(df['date'])
+            date_min, date_max = dates.min(), dates.max()
         except Exception:
-            pass
+            date_min = pd.Timestamp('2008-01-01')
+            date_max = pd.Timestamp('2018-12-31')
+        date_range_days = (date_max - date_min).days
+        
+        # Generate synthetic interactions
+        synth_rows = []
+        attempts = 0
+        max_attempts = target_rows * 3  # Prevent infinite loop
+        
+        while len(synth_rows) < target_rows and attempts < max_attempts:
+            attempts += 1
+            # Sample user and recipe by popularity (realistic distribution)
+            u = np.random.choice(users, p=user_weights)
+            r = np.random.choice(recipes, p=recipe_weights)
+            
+            # Skip if this (user, recipe) pair already exists
+            if (u, r) in existing_pairs:
+                continue
+            existing_pairs.add((u, r))
+            
+            # Generate rating: blend user and recipe means + Gaussian noise
+            u_mean = user_mean_rating.get(u, 3.5)
+            r_mean = recipe_mean_rating.get(r, 3.5)
+            blended = 0.5 * u_mean + 0.5 * r_mean
+            rating = np.clip(round(blended + np.random.normal(0, 0.8)), 0, 5)
+            
+            # Generate date: uniform within original range (no future leakage)
+            random_day = np.random.randint(0, max(date_range_days, 1))
+            synth_date = (date_min + pd.Timedelta(days=random_day)).strftime('%Y-%m-%d')
+            
+            synth_rows.append({
+                'user_id': u, 'recipe_id': r,
+                'rating': float(rating), 'date': synth_date,
+                'review': ''  # Empty review for synthetic rows
+            })
+        
+        synth_df = pd.DataFrame(synth_rows)
         df = pd.concat([df, synth_df], ignore_index=True)
-        print(f"Expanded from {original_len} to {len(df)} rows.")
+        print(f"Expanded from {original_len} to {len(df)} rows "
+              f"({len(synth_rows)} synthetic interactions generated).")
 
     # Mealie Alignment: Convert Kaggle IDs into Mealie String prefixed IDs
     df['user_id'] = 'user:' + df['user_id'].astype(str)
