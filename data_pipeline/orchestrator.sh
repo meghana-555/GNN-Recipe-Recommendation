@@ -37,7 +37,7 @@ python serve_recommendations.py
 # 4. Launch Traffic Generator as background daemon
 echo ""
 echo "🤖 [STAGE 4] Launching Continuous Traffic Generator (Background)..."
-python generator.py --duration -1 --interval 90 --users 5 &
+python generator.py --duration -1 --interval 90 --users 6 &
 GENERATOR_PID=$!
 echo "✅ Generator running in background (PID: $GENERATOR_PID, 5 personas, interval: 90s)"
 

@@ -80,6 +80,15 @@ PERSONAS = [
         "mealplan_probability": 0.40,                # always plans meals
         "preferred_keywords": ["roast", "steak", "pasta", "soup"],
     },
+    {
+        "name": "picky_critic",
+        "email_suffix": "picky",
+        "rating_weights": [20, 25, 30, 18, 7],      # harsh rater (skews 1-3, mean ≈ 2.67)
+        "activity_multiplier": 1.0,                  # moderately active
+        "favorite_probability": 0.05,                # rarely favorites anything
+        "mealplan_probability": 0.03,                # almost never plans
+        "preferred_keywords": [],                    # tries everything, complains about most
+    },
 ]
 
 
